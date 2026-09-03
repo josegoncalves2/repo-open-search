@@ -67,9 +67,15 @@ api -XPUT "${OS_URL}/_cluster/settings" -d "{
     \"plugins.ml_commons.native_memory_threshold\": 100,
     \"plugins.ml_commons.jvm_heap_memory_threshold\": 100,
     \"plugins.ml_commons.disk_free_space_threshold\": -1,
-    \"plugins.ml_commons.allow_registering_model_via_url\": true
+    \"plugins.ml_commons.allow_registering_model_via_url\": true,
+    \"plugins.ml_commons.ml_task_timeout_in_seconds\": 3600
   }
 }" | jq -c '{acknowledged}'
+# ml_task_timeout_in_seconds: o padrao (600s) NAO cobre o primeiro registro de
+# um modelo local em volume novo - o ML Commons precisa baixar o modelo e o
+# runtime nativo do PyTorch/DJL (centenas de MB) e descompacta-lo. Ao estourar,
+# a task vira FAILED com "timeout after 600 seconds" e o agent acaba sem
+# VectorDBTool. 3600s da folga; nas subidas seguintes o cache ja existe.
 
 # --------------------------------------------------------------------------
 echo "==> 1. Connector ${CONNECTOR_NAME} (OpenAI-compatible -> ${LLM_PROVIDER})"
@@ -134,6 +140,20 @@ if [ -z "$CONNECTOR_ID" ]; then
 else
   # Idempotencia real: reaproveitar o connector pelo nome deixaria uma definicao
   # antiga (ex.: com 'messages') no ar para sempre. Atualiza sempre.
+  # Um connector EM USO por um modelo deployado recusa o PUT com HTTP 400
+  # ("N models are still using this connector"). Undeploy antes; o passo 2
+  # redeploya (CONNECTOR_UPDATED=1).
+  # 'connector_id' e campo text (analisado) -> 'term' nao casa o id com '-' e
+  # maiusculas; usar 'match'.
+  undeployed_any=0
+  for mid in $(api "${OS_URL}/_plugins/_ml/models/_search" \
+        -d "{\"size\":20,\"_source\":[\"model_state\"],\"query\":{\"match\":{\"connector_id\":\"${CONNECTOR_ID}\"}}}" \
+        | jq -r '.hits.hits[] | select(._source.model_state=="DEPLOYED" or ._source.model_state=="PARTIALLY_DEPLOYED") | ._id'); do
+    echo "    undeploy do modelo ${mid} (usa este connector)"
+    api -XPOST "${OS_URL}/_plugins/_ml/models/${mid}/_undeploy" >/dev/null 2>&1 || true
+    undeployed_any=1
+  done
+  [ "$undeployed_any" = 1 ] && sleep 3
   api -XPUT "${OS_URL}/_plugins/_ml/connectors/${CONNECTOR_ID}" \
     --data-binary "$CONNECTOR_BODY" | jq -c '{result: (.result // .status // "updated")}'
   CONNECTOR_UPDATED=1
@@ -176,23 +196,51 @@ EMB_MODEL_ID=$(api "${OS_URL}/_plugins/_ml/models/_search" \
         {\"terms\":{\"model_state\":[\"DEPLOYED\",\"REGISTERED\",\"PARTIALLY_DEPLOYED\"]}}]}}}" \
   | jq -r '.hits.hits[0]._id // empty')
 
-if [ -z "$EMB_MODEL_ID" ]; then
-  TASK_ID=$(api -XPOST "${OS_URL}/_plugins/_ml/models/_register?deploy=true" -d "{
+# O 1o registro em volume novo baixa o modelo + o runtime nativo do PyTorch/DJL
+# (centenas de MB) e descompacta. Pode levar 10-30min em host modesto. Por isso:
+# espera longa, com estado visivel, e 1 nova tentativa se a task falhar (o que
+# ja baixou fica em cache, entao a 2a passa e bem mais rapida).
+register_embeddings() {   # imprime o task_id
+  api -XPOST "${OS_URL}/_plugins/_ml/models/_register?deploy=true" -d "{
     \"name\": \"${EMBEDDING_MODEL}\",
     \"version\": \"${EMBEDDING_VERSION}\",
     \"model_format\": \"TORCH_SCRIPT\"
-  }" | jq -r '.task_id // empty')
-  if [ -n "$TASK_ID" ]; then
-    for _ in $(seq 1 60); do
-      EMB_MODEL_ID=$(api "${OS_URL}/_plugins/_ml/tasks/${TASK_ID}" | jq -r '.model_id // empty')
-      [ -n "$EMB_MODEL_ID" ] && break
-      sleep 10
-    done
-    [ -n "${EMB_MODEL_ID:-}" ] && echo "    embeddings: ${EMB_MODEL_ID} -> $(wait_model "$EMB_MODEL_ID" || true)" \
-      || echo "    (embeddings ainda registrando - task ${TASK_ID})"
-  else
-    echo "    aviso: registro do modelo de embeddings nao retornou task_id"
-  fi
+  }" | jq -r '.task_id // empty'
+}
+
+wait_task() {   # $1 = task_id ; imprime "<state>|<model_id>" ; 0 se COMPLETED
+  local tid="$1" line st mid
+  for _ in $(seq 1 240); do    # 240 x 15s = 60min
+    line=$(api "${OS_URL}/_plugins/_ml/tasks/${tid}" \
+             | jq -r '"\(.state // "??")|\(.model_id // "")"')
+    st=${line%%|*}; mid=${line#*|}
+    case "$st" in
+      COMPLETED)                    echo "${st}|${mid}"; return 0 ;;
+      FAILED|COMPLETED_WITH_ERROR)  echo "${st}|${mid}"; return 1 ;;
+    esac
+    sleep 15
+  done
+  echo "TIMEOUT|${mid}"; return 1
+}
+
+if [ -z "$EMB_MODEL_ID" ]; then
+  for attempt in 1 2; do
+    TASK_ID=$(register_embeddings)
+    if [ -z "$TASK_ID" ]; then
+      echo "    aviso: registro do modelo de embeddings nao retornou task_id"
+      break
+    fi
+    echo "    tentativa ${attempt}: task ${TASK_ID} (baixa modelo + runtime PyTorch; pode demorar)"
+    RES=$(wait_task "$TASK_ID") && RC=0 || RC=1
+    ST=${RES%%|*}; MID=${RES#*|}
+    if [ "$RC" = 0 ] && [ -n "$MID" ]; then
+      EMB_MODEL_ID="$MID"
+      echo "    embeddings: ${EMB_MODEL_ID} -> $(wait_model "$EMB_MODEL_ID" || true)"
+      break
+    fi
+    echo "    tentativa ${attempt} terminou em '${ST}'"
+  done
+  [ -n "${EMB_MODEL_ID:-}" ] || echo "    AVISO: embeddings nao registraram - o agent fica SEM VectorDBTool. Reexecute com 'docker compose up -d --force-recreate provisioner' (o que ja baixou fica em cache)."
 else
   echo "    embeddings ja existe: ${EMB_MODEL_ID}"
 fi
@@ -217,7 +265,11 @@ add_tool() {  # $1 = type ; $2 = json completo da tool
   fi
 }
 
-add_tool ListIndexTool    '{ "type": "ListIndexTool", "name": "ListIndexTool" }'
+# 'indices' fixo em "*,-.*": no OpenSearch 3.8 o ListIndexTool usa a API
+# paginada GET /_list/indices, e ela responde 403 ("no permissions for []")
+# quando o alvo resolve indices de sistema (.*). Restringindo a nao-sistema,
+# GET /_list/indices/*,-.* responde 200.
+add_tool ListIndexTool    '{ "type": "ListIndexTool", "name": "ListIndexTool", "parameters": { "indices": ["*", "-.*"] } }'
 add_tool IndexMappingTool '{ "type": "IndexMappingTool", "name": "IndexMappingTool" }'
 add_tool SearchIndexTool  '{ "type": "SearchIndexTool", "name": "SearchIndexTool" }'
 add_tool CatIndexTool     '{ "type": "CatIndexTool", "name": "CatIndexTool" }'
@@ -243,7 +295,7 @@ register_agent() {
         \"max_iteration\": 5,
         \"response_filter\": \"\$.choices[0].message.content\",
         \"message_history_limit\": 5,
-        \"disable_trace\": false
+        \"disable_trace\": true
       }
     },
     \"memory\": { \"type\": \"conversation_index\" },
@@ -290,6 +342,75 @@ else
   echo "    $CFG"
   echo "    -> defina o Root agent manualmente no Dashboards:"
   echo "       Assistant -> Settings -> Root agent id = ${AGENT_ID}"
+fi
+
+# --------------------------------------------------------------------------
+echo "==> 5b. Agentes de resumo do Assistant (os_summary / os_summary_with_log_pattern)"
+# Sem estes, o Dashboards loga a cada navegacao que usa 'Summarize':
+#   [status_exception]: Failed to find config with the provided config id: os_summary
+# Sao flow agents simples com um MLModelTool apontando para o mesmo LLM.
+register_flow_summary() {  # $1 = nome amigavel
+  api -XPOST "${OS_URL}/_plugins/_ml/agents/_register" -d "{
+    \"name\": \"$1\",
+    \"type\": \"flow\",
+    \"description\": \"Flow agent de resumo do OpenSearch Assistant\",
+    \"tools\": [{
+      \"type\": \"MLModelTool\",
+      \"name\": \"ml_model_tool\",
+      \"description\": \"Resume o contexto fornecido\",
+      \"parameters\": {
+        \"model_id\": \"${LLM_MODEL_ID}\",
+        \"prompt\": \"Voce e o OpenSearch Assistant. Resuma de forma objetiva, em portugues, o conteudo a seguir. Se houver uma pergunta, responda-a com base nele.\\n\\nContexto:\\n\${parameters.context}\\n\\nPergunta: \${parameters.question}\\n\\nResumo:\"
+      }
+    }]
+  }" | jq -r '.agent_id // empty'
+}
+
+for cfg in os_summary os_summary_with_log_pattern; do
+  existing=$(api "${OS_URL}/.plugins-ml-config/_doc/${cfg}" | jq -r '._source.configuration.agent_id // empty')
+  if [ -n "$existing" ] && api "${OS_URL}/_plugins/_ml/agents/${existing}" | jq -e '.type' >/dev/null 2>&1; then
+    echo "    ${cfg} ja aponta para agent valido (${existing})"
+    continue
+  fi
+  said=$(register_flow_summary "OpenSearch Assistant Summary Agent (${cfg})")
+  if [ -n "$said" ] && [ "$said" != null ]; then
+    r=$(api -XPUT "${OS_URL}/.plugins-ml-config/_doc/${cfg}" -d "{
+      \"type\": \"${cfg}\",
+      \"configuration\": { \"agent_id\": \"${said}\" }
+    }" | jq -r '.result // .status // "?"')
+    echo "    ${cfg} -> agent ${said} (${r})"
+  else
+    echo "    aviso: nao consegui registrar o agent para ${cfg}"
+  fi
+done
+
+# --------------------------------------------------------------------------
+# Semeia um indice minimo. Alem de dar dado real para o Dashboards, evita que
+# ListIndexTool/PPLTool logem ERROR ("Failed to fetch index info for page: null")
+# quando o agent e exercitado num cluster totalmente vazio.
+echo "==> 5c. Indice de amostra 'sample-logs'"
+if ! api -o /dev/null -w '%{http_code}' "${OS_URL}/sample-logs" | grep -q 200; then
+  api -XPUT "${OS_URL}/sample-logs" -d '{
+    "settings": { "number_of_replicas": 0 },
+    "mappings": { "properties": {
+      "@timestamp": { "type": "date" },
+      "level": { "type": "keyword" },
+      "service": { "type": "keyword" },
+      "message": { "type": "text" }
+    }}
+  }' | jq -c '{acknowledged}' 2>/dev/null || true
+  api -XPOST "${OS_URL}/sample-logs/_bulk" --data-binary '
+{"index":{}}
+{"@timestamp":"2026-09-03T12:00:00Z","level":"INFO","service":"api","message":"stack provisionada"}
+{"index":{}}
+{"@timestamp":"2026-09-03T12:01:00Z","level":"WARN","service":"api","message":"exemplo de aviso"}
+{"index":{}}
+{"@timestamp":"2026-09-03T12:02:00Z","level":"ERROR","service":"worker","message":"exemplo de erro"}
+' | jq -c '{errors}' 2>/dev/null || true
+  api -XPOST "${OS_URL}/sample-logs/_refresh" >/dev/null 2>&1 || true
+  echo "    sample-logs criado (3 docs)"
+else
+  echo "    sample-logs ja existe"
 fi
 
 # --------------------------------------------------------------------------

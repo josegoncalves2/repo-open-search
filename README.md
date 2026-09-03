@@ -221,7 +221,50 @@ Conferir ingestão:
 curl -k -u pmotiadm:pmotiadm 'https://localhost:9200/_cat/indices/logs-*?v'
 ```
 
-## 7. Troubleshooting
+## 7. Logs limpos
+
+```bash
+docker compose logs | grep -E "\[WARN |\[ERROR|\[DEPRECATION|WARNING:|SLF4J"
+```
+
+**Regime permanente: zero linhas** em `opensearch-dashboards`, `provisioner` e
+`enroll`. Depois do boot, `opensearch-node` também não emite mais nada.
+
+### O que foi corrigido (e como)
+
+| Ruído | Correção |
+|---|---|
+| `PluginSettings`/`StatsCollector`: `performance-analyzer.properties` e `plugin-stats-metadata` não existem | plugin **Performance Analyzer removido** no `scripts/opensearch-entrypoint.sh` (nada na stack usa) |
+| `security_exception ... requestedTenant=__user__` e 403 em `/tenantinfo` | Dashboards passou a usar a conta de serviço **`kibanaserver`**; multitenancy desligada |
+| `opensearch.requestHeadersWhitelist is deprecated` | renomeado para `requestHeadersAllowlist` |
+| `Failed to find config ... os_summary` / `os_summary_with_log_pattern` | `setup-ai.sh` registra os **flow agents de resumo** do Assistant |
+| `ListIndexTool: Failed to fetch index info for page: null` | tool fixada em `indices: ["*","-.*"]` — o `GET /_list/indices` dá 403 quando o alvo resolve índices de sistema |
+| `UpdateConnector: N models are still using this connector` (HTTP 400) | `setup-ai.sh` faz undeploy dos modelos antes de atualizar o connector |
+| `settings_exception: plugins.security_analytics.enable_detectors not recognized` | setting inexistente removido do `setup-features.sh` |
+| `BackendRegistry: No 'Authorization' header` a cada 10s | healthcheck e sonda do provisioner passaram a **autenticar** |
+| `insecure file permissions` (7×, certs demo) | `chmod 600/700` no entrypoint, depois do instalador demo |
+| `node.max_local_storage_nodes` deprecated | linha removida do `opensearch.yml` gerado |
+| `SQLPlugin: Master key is a required config` | `plugins.query.datasources.encryption.masterkey` definida |
+| `sun.misc.Unsafe`, `Restricted methods`, `System::load` (JVM, 8 linhas) | `--enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow` no `OPENSEARCH_JAVA_OPTS` |
+| `AuditMessageRouter`, salt de compliance, `transport_enabled`, `HookRegistry`, `DanglingIndicesState`, `StreamTransportService`, `SecurityAnalyticsPlugin` | `logger.*=ERROR` no `docker-compose.yml` (via `-E`, no startup) — todos são FYI/corridas de boot que se resolvem sozinhas |
+
+### O que sobra (≈13 linhas, só no boot frio)
+
+Nenhuma recorre e nenhuma afeta o funcionamento:
+
+| Linha | Por que fica |
+|---|---|
+| `WARNING: Using incubator modules: jdk.incubator.vector` (1) | vem de `--add-modules=jdk.incubator.vector` no `jvm.options` da imagem; remover desliga a vetorização SIMD do Lucene |
+| `[WARN][stderr] PanamaVectorizationProvider ...` (2) | o Lucene imprime o mesmo aviso em stderr |
+| `[WARN][stderr] SLF4J: ...` (6) | plugins da imagem trazem `slf4j-api` (1.7 e 2.x) sem provider no mesmo classloader — bug de empacotamento da imagem |
+| `[ERROR] BackendRegistry: Security not initialized` (~2) | sondas que chegam nos ~10s em que o índice de segurança ainda sobe; normal em qualquer OpenSearch |
+| `[WARN] Failed to load API tokens on node start` (1) | corrida de boot (`state not recovered`); resolve sozinha |
+| `[ERROR] MLModelManager: No controller is deployed` (1) | o ML Commons loga em ERROR um estado **esperado** (modelo sem rate-limiter) |
+
+Eliminar as 9 primeiras exigiria reconstruir a imagem (`Dockerfile` próprio com
+`jvm.options` editado e `slf4j-nop` nos plugins). As 4 últimas são transitórias.
+
+## 8. Troubleshooting
 
 **`Weak password` ao criar usuário** — use hash bcrypt em vez de senha em
 texto puro; ver [Como a senha fraca é aplicada](#como-a-senha-fraca-é-aplicada).

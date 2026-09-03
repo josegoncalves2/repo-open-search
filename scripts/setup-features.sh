@@ -36,10 +36,24 @@ api -XPUT "${OS_URL}/_cluster/settings" -d '{
     "plugins.ml_commons.jvm_heap_memory_threshold": 100,
     "plugins.ml_commons.disk_free_space_threshold": -1,
     "plugins.anomaly_detection.enabled": true,
-    "plugins.index_state_management.enabled": true,
-    "plugins.security_analytics.enable_detectors": true
+    "plugins.index_state_management.enabled": true
   }
 }' | head -c 400; echo
+# NB: os ajustes de logger.* ficam no docker-compose.yml (via -E no startup) -
+# aplicados como cluster settings aqui eles chegariam tarde demais para calar
+# o que a camada de seguranca ja logou no boot.
+
+echo
+echo "==> Template single-node: 0 replicas (senao o cluster fica 'yellow')"
+# Num no unico as shards replica ficam UNASSIGNED -> health yellow para sempre.
+# Template de baixa prioridade cobrindo indices de usuario.
+api -XPUT "${OS_URL}/_index_template/zzz-single-node-no-replica" -d '{
+  "index_patterns": ["*"],
+  "priority": 1,
+  "template": { "settings": { "number_of_replicas": 0 } }
+}' | head -c 200; echo
+# aplica aos indices de usuario ja existentes (nao-sistema)
+api -XPUT "${OS_URL}/*,-.*/_settings" -d '{"index":{"number_of_replicas":0}}' | head -c 200; echo
 
 echo
 echo "==> Plugins instalados no no"

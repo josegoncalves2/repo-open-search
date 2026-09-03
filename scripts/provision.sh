@@ -29,11 +29,14 @@ warn() { printf '\033[1;33m[provision]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[provision]\033[0m %s\n' "$*" >&2; exit 1; }
 
 # --------------------------- 1. espera a seguranca -------------------------
+# Sonda JA autenticada como 'admin' (bootstrap): uma sonda anonima deixaria
+# "BackendRegistry: No 'Authorization' header" no log do no. 200 = seguranca
+# no ar; 401/403 = no ar mas ainda inicializando o indice de seguranca.
 log "Aguardando a camada de seguranca do OpenSearch em ${OS_URL}"
 ok=""
 for _ in $(seq 1 60); do
-  code=$(curl -sk -o /dev/null -w '%{http_code}' "${OS_URL}" || true)
-  case "$code" in 200|401) ok=1; break ;; esac
+  code=$(curl -sk -o /dev/null -w '%{http_code}' -u "${BOOT_USER}:${BOOT_PASS}" "${OS_URL}" || true)
+  case "$code" in 200) ok=1; break ;; esac
   sleep 3
 done
 [ -n "$ok" ] || die "OpenSearch nao respondeu a tempo"

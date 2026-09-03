@@ -2,6 +2,10 @@ services:
   opensearch:
     image: opensearchproject/opensearch:${OPENSEARCH_VERSION}
     container_name: opensearch-node
+    # wrapper: remove Performance Analyzer, roda o instalador demo, limpa linhas
+    # ruidosas do opensearch.yml e aperta permissoes antes do entrypoint oficial.
+    # Ver scripts/opensearch-entrypoint.sh.
+    entrypoint: ["/bin/bash", "/opensearch-entrypoint.sh"]
     environment:
       - cluster.name=${CLUSTER_NAME}
       - node.name=${NODE_NAME}
@@ -18,6 +22,32 @@ services:
       # (por isso NAO montamos um opensearch.yml com 'plugins.security.*': isso
       #  faz o instalador pular a geracao de certs -> "No SSL configuration found")
       - DISABLE_INSTALL_DEMO_CONFIG=false
+      - DISABLE_PERFORMANCE_ANALYZER_AGENT_CLI=true
+      - plugins.security.audit.type=noop
+      # master key do SQL/PPL datasources (32 bytes hex) - sem isto o SQLPlugin
+      # loga "Master key is a required config for using create and update datasource APIs".
+      - plugins.query.datasources.encryption.masterkey=a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f901
+      # ---- loggers subidos para ERROR no STARTUP (via -E; cluster settings do
+      #      setup-features.sh chegam tarde demais para calar o boot) -----------
+      # Cada um abaixo so emite 1 linha FYI/ruido, uma vez, no boot - e no nivel
+      # ERROR ainda mostra falha real da mesma classe:
+      #   security.configuration.Salt ... "configure compliance salt ..." (nao usamos field masking)
+      #   security.auditlog ............. "AuditMessageRouter: No endpoint configured [...]"
+      #   deprecation.security ......... 'transport_enabled'/'disabled_categories' da config demo
+      #   ml.common.hooks .............. "No callbacks registered for event type ..."
+      #   gateway.DanglingIndicesState . "gateway.auto_import_dangling_indices is disabled"
+      #   ml...TransportPredictionStreamTaskAction / ...ExecuteStream... "StreamTransportService is not available"
+      - logger.org.opensearch.security.configuration=ERROR
+      - logger.org.opensearch.security.auditlog=ERROR
+      - logger.org.opensearch.deprecation.security=ERROR
+      - logger.org.opensearch.ml.common.hooks=ERROR
+      - logger.org.opensearch.gateway.DanglingIndicesState=ERROR
+      - logger.org.opensearch.ml.action.prediction.TransportPredictionStreamTaskAction=ERROR
+      - logger.org.opensearch.ml.action.execute.TransportExecuteStreamTaskAction=ERROR
+      # SecurityAnalyticsPlugin: "Failed to initialize LogType config index" e uma
+      # corrida de boot que se resolve sozinha (os indices .opensearch-sap-* ficam
+      # green segundos depois). A classe so loga ciclo de vida do plugin.
+      - logger.org.opensearch.securityanalytics.SecurityAnalyticsPlugin=ERROR
       # ---- features de IA / Agentic / LLM como node settings (via env) --------
       - plugins.ml_commons.agent_framework_enabled=true
       - plugins.ml_commons.rag_pipeline_feature_enabled=true
@@ -39,6 +69,7 @@ services:
       nofile:  { soft: 65536, hard: 65536 }
     volumes:
       - opensearch-data:/usr/share/opensearch/data
+      - ./scripts/opensearch-entrypoint.sh:/opensearch-entrypoint.sh:ro
     ports:
       - "${OPENSEARCH_PORT}:9200"
       - "${OPENSEARCH_PERF_PORT}:9600"
@@ -47,16 +78,19 @@ services:
       resources:
         limits: { memory: "${OPENSEARCH_MEM_LIMIT}" }
     healthcheck:
-      # desacoplado da senha: 200 (sem seguranca) ou 401 (seguranca no ar) = vivo
+      # autentica com a conta reservada 'admin' (probe sem credencial deixa
+      # "BackendRegistry: No 'Authorization' header" no log). Nos primeiros ~15s
+      # de um boot frio o servidor ainda loga alguns "Security not initialized"
+      # ate a camada de seguranca subir - isso e normal em qualquer OpenSearch.
       test:
         - CMD-SHELL
         - >-
-          c=$$(curl -sk -o /dev/null -w '%{http_code}' https://localhost:9200);
-          [ "$$c" = 200 ] || [ "$$c" = 401 ]
-      interval: 10s
+          curl -sk -u "admin:$${OPENSEARCH_INITIAL_ADMIN_PASSWORD}"
+          -o /dev/null -w '%{http_code}' https://localhost:9200 | grep -q 200
+      interval: 15s
       timeout: 10s
       retries: 40
-      start_period: 60s
+      start_period: 90s
     restart: unless-stopped
 
   # -----------------------------------------------------------------------
@@ -97,8 +131,12 @@ services:
     container_name: opensearch-dashboards
     environment:
       - OPENSEARCH_HOSTS=["https://opensearch:9200"]
-      - OPENSEARCH_USERNAME=${OPENSEARCH_ADMIN_USER}
-      - OPENSEARCH_PASSWORD=${OPENSEARCH_ADMIN_PASSWORD}
+      # conta de SERVICO do Dashboards: tem de ser 'kibanaserver' (role
+      # kibana_server). O superuser 'pmotiadm'/all_access NAO tem a permissao
+      # de /_plugins/_security/tenantinfo -> 403 no boot + "AuthorizationException".
+      # O login humano no navegador continua sendo pmotiadm/pmotiadm.
+      - OPENSEARCH_USERNAME=kibanaserver
+      - OPENSEARCH_PASSWORD=kibanaserver
       - OPENSEARCH_SSL_VERIFICATIONMODE=none
       - SERVER_HOST=0.0.0.0
       - SERVER_PORT=5601
