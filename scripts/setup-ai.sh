@@ -128,8 +128,11 @@ if [ -z "$CONNECTOR_ID" ]; then
       --data-binary "$CONNECTOR_BODY")
     CONNECTOR_ID=$(echo "$CREATE_RESP" | jq -r '.connector_id // empty')
     [ -n "$CONNECTOR_ID" ] && break
+    # 15s (nao 6s): em cluster novo a 1a chamada dispara a criacao da master key
+    # de criptografia do ML; tentativas muito juntas colidem e o no loga
+    # "version conflict putting master_key" + "Failed to encrypt credentials".
     echo "    tentativa ${attempt}/10 falhou: $(echo "$CREATE_RESP" | head -c 200)"
-    sleep 6
+    sleep 15
   done
   if [ -z "$CONNECTOR_ID" ]; then
     echo "    FALHA ao criar connector apos 10 tentativas. Ultima resposta:"

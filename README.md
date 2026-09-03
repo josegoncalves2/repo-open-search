@@ -248,21 +248,21 @@ docker compose logs | grep -E "\[WARN |\[ERROR|\[DEPRECATION|WARNING:|SLF4J"
 | `sun.misc.Unsafe`, `Restricted methods`, `System::load` (JVM, 8 linhas) | `--enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow` no `OPENSEARCH_JAVA_OPTS` |
 | `AuditMessageRouter`, salt de compliance, `transport_enabled`, `HookRegistry`, `DanglingIndicesState`, `StreamTransportService`, `SecurityAnalyticsPlugin` | `logger.*=ERROR` no `docker-compose.yml` (via `-E`, no startup) — todos são FYI/corridas de boot que se resolvem sozinhas |
 
-### O que sobra (≈13 linhas, só no boot frio)
+### O que sobra (15 linhas, só no boot)
 
-Nenhuma recorre e nenhuma afeta o funcionamento:
+Nenhuma recorre depois que o nó sobe e nenhuma afeta o funcionamento:
 
-| Linha | Por que fica |
-|---|---|
-| `WARNING: Using incubator modules: jdk.incubator.vector` (1) | vem de `--add-modules=jdk.incubator.vector` no `jvm.options` da imagem; remover desliga a vetorização SIMD do Lucene |
-| `[WARN][stderr] PanamaVectorizationProvider ...` (2) | o Lucene imprime o mesmo aviso em stderr |
-| `[WARN][stderr] SLF4J: ...` (6) | plugins da imagem trazem `slf4j-api` (1.7 e 2.x) sem provider no mesmo classloader — bug de empacotamento da imagem |
-| `[ERROR] BackendRegistry: Security not initialized` (~2) | sondas que chegam nos ~10s em que o índice de segurança ainda sobe; normal em qualquer OpenSearch |
-| `[WARN] Failed to load API tokens on node start` (1) | corrida de boot (`state not recovered`); resolve sozinha |
-| `[ERROR] MLModelManager: No controller is deployed` (1) | o ML Commons loga em ERROR um estado **esperado** (modelo sem rate-limiter) |
+| Linha | Qtd | Por que fica |
+|---|---|---|
+| `WARNING: Using incubator modules: jdk.incubator.vector` | 1 | vem de `--add-modules=jdk.incubator.vector` no `jvm.options` da imagem; remover desliga a vetorização SIMD do Lucene |
+| `[WARN][stderr] PanamaVectorizationProvider` / `Java vector incubator API enabled` | 2 | o Lucene imprime o mesmo aviso em stderr |
+| `[WARN][stderr] SLF4J: ...` | 6 | plugins da imagem trazem `slf4j-api` (1.7 **e** 2.x) sem provider no mesmo classloader — empacotamento da imagem |
+| `[ERROR] BackendRegistry: Security not initialized` | ~4 | sondas que chegam nos ~15 s em que o índice de segurança ainda sobe; normal em qualquer OpenSearch |
+| `[WARN] Failed to load API tokens on node start` | 1 | corrida de boot (`state not recovered`); resolve sozinha |
+| `[ERROR] MLModelManager: No controller is deployed` | 1 | o ML Commons loga em ERROR um estado **esperado** (modelo sem rate-limiter) |
 
-Eliminar as 9 primeiras exigiria reconstruir a imagem (`Dockerfile` próprio com
-`jvm.options` editado e `slf4j-nop` nos plugins). As 4 últimas são transitórias.
+As 9 primeiras só sairiam reconstruindo a imagem (`Dockerfile` próprio com
+`jvm.options` editado e `slf4j-nop` nos plugins). As 6 últimas são transitórias.
 
 ## 8. Troubleshooting
 
@@ -282,6 +282,25 @@ batem com o `.env`.
 
 **LLM não responde** — verifique `LLM_API_KEY` no `.env`, conectividade HTTPS
 ao OpenRouter e `docker compose logs opensearch | grep -i ml`.
+
+**`Embedding model: <pendente>` / agente sem `VectorDBTool`** — no **primeiro**
+boot com volume novo o ML Commons precisa baixar o modelo *e* o runtime nativo
+do PyTorch/DJL (centenas de MB) e descompactá-lo; em host modesto isso passa
+dos 600 s do timeout padrão e a task vira `FAILED: timeout after 600 seconds`.
+O `setup-ai.sh` já sobe `plugins.ml_commons.ml_task_timeout_in_seconds` para
+3600 e tenta duas vezes. Se ainda assim falhar:
+
+```bash
+docker compose up -d --force-recreate provisioner
+docker compose logs -f opensearch-provisioner
+```
+
+A segunda execução é bem mais rápida — o que já baixou fica em cache no
+container. Confira o estado da task com:
+
+```bash
+curl -k -u pmotiadm:pmotiadm 'https://localhost:9200/_plugins/_ml/tasks/<task_id>'
+```
 
 **Container encerra com Exit 137** — `vm.max_map_count` ou RAM insuficiente
 (ver seção 1).

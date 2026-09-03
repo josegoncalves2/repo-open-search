@@ -44,10 +44,19 @@ done
 auth_ok() { curl -sk -u "$1:$2" "${OS_URL}/_cluster/health" | grep -q '"status"'; }
 
 # --------------------------- 2. quem autentica? ----------------------------
-if auth_ok "$ADMIN_USER" "$ADMIN_PASS"; then
-  CU="$ADMIN_USER"; CP="$ADMIN_PASS"; log "superusuario '${ADMIN_USER}' ja existe"
-elif auth_ok "$BOOT_USER" "$BOOT_PASS"; then
+# Tenta o bootstrap 'admin' PRIMEIRO e so entao pergunta (pela API, ja
+# autenticado) se o superusuario final existe. Tentar autenticar direto como
+# <ADMIN_USER> deixaria "BackendRegistry: Authentication finally failed for
+# <user>" no log do no toda vez que o volume for novo.
+if auth_ok "$BOOT_USER" "$BOOT_PASS"; then
   CU="$BOOT_USER"; CP="$BOOT_PASS"; log "autenticado como admin (bootstrap)"
+  if curl -sk -u "${CU}:${CP}" "${OS_URL}/_plugins/_security/api/internalusers/${ADMIN_USER}" \
+       | grep -q "\"${ADMIN_USER}\""; then
+    log "superusuario '${ADMIN_USER}' ja existe"
+    CU="$ADMIN_USER"; CP="$ADMIN_PASS"
+  fi
+elif auth_ok "$ADMIN_USER" "$ADMIN_PASS"; then
+  CU="$ADMIN_USER"; CP="$ADMIN_PASS"; log "superusuario '${ADMIN_USER}' ja existe"
 else
   die "Nenhuma credencial conhecida autentica. Se o volume tem um indice de \
 seguranca antigo, rode 'docker compose down -v' e suba de novo."
