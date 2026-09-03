@@ -1,0 +1,14 @@
+id,name,parentId
+1,CEO,
+2,CTO,1
+3,CFO,1
+4,COO,1
+5,Engineering Manager,2
+6,Senior Engineer,5
+7,Junior Engineer,5
+8,DevOps Engineer,2
+9,Finance Manager,3
+10,Accountant,9
+11,Operations Manager,4
+12,HR Lead,4
+13,Recruiter,12
