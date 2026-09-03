@@ -6,12 +6,22 @@
 #
 #  Desinstalar (mantem os volumes):   ./install.sh --uninstall
 #  Desinstalar + apagar dados:        ./install.sh --purge
+#
+#  O script BAIXA O REPOSITORIO inteiro para $STACK_DIR e usa o
+#  docker-compose.yml de verdade (com o servico 'provisioner', que cria o
+#  superusuario, ativa as features e provisiona IA/Agentic/LLM).
+#  Nada de compose embutido: uma fonte da verdade so.
 # ===========================================================================
 set -euo pipefail
 
 STACK_DIR="${STACK_DIR:-/opt/opensearch}"
-OPENSEARCH_VERSION="${OPENSEARCH_VERSION:-3.8.0}"
-ADMIN_PASS="${OPENSEARCH_INITIAL_ADMIN_PASSWORD:-P@ssw0rd2026!Key123}"
+REPO_SLUG="${REPO_SLUG:-josegoncalves2/repo-open-search}"
+REPO_REF="${REPO_REF:-main}"
+
+# Senhas / credenciais (sobrescreva via variaveis de ambiente antes de rodar)
+INITIAL_ADMIN_PASS="${OPENSEARCH_INITIAL_ADMIN_PASSWORD:-P@ssw0rd2026!Key123}"
+ADMIN_USER="${OPENSEARCH_ADMIN_USER:-pmotiadm}"
+ADMIN_PASS="${OPENSEARCH_ADMIN_PASSWORD:-pmotiadm}"
 AGENT_USER="${AGENT_USER:-agent-ingest}"
 AGENT_PASS="${AGENT_PASS:-Ag3nt!Ingest2026#Log}"
 
@@ -30,7 +40,7 @@ case "${1:-}" in
 esac
 
 # =========================== 1. PRE-REQUISITOS ==============================
-log "1/6  Verificando pre-requisitos do host"
+log "1/5  Verificando pre-requisitos do host"
 
 if ! command -v docker >/dev/null 2>&1; then
   log "Docker nao encontrado - instalando via get.docker.com"
@@ -38,6 +48,8 @@ if ! command -v docker >/dev/null 2>&1; then
   $SUDO systemctl enable --now docker
 fi
 $SUDO docker compose version >/dev/null 2>&1 || die "Docker Compose v2 nao disponivel."
+command -v curl >/dev/null 2>&1 || die "curl e obrigatorio."
+command -v tar  >/dev/null 2>&1 || die "tar e obrigatorio."
 
 # vm.max_map_count: exigido pelo Lucene. Aplica agora + torna persistente.
 CURRENT=$(sysctl -n vm.max_map_count)
@@ -50,190 +62,105 @@ else
   log "vm.max_map_count ja adequado ($CURRENT >= 262144)"
 fi
 
-# Aviso de RAM: OpenSearch + Dashboards pedem ~4 GB confortaveis
 RAM_GB=$(awk '/MemTotal/ {printf "%d", $2/1024/1024}' /proc/meminfo)
 [ "$RAM_GB" -ge 4 ] || warn "Host com ${RAM_GB}GB de RAM. Recomendado: 4GB+."
 
-# =========================== 2. ARQUIVOS ====================================
-log "2/6  Escrevendo arquivos em $STACK_DIR"
-$SUDO mkdir -p "$STACK_DIR/agent"
+# =========================== 2. BAIXAR O REPOSITORIO ========================
+log "2/5  Baixando ${REPO_SLUG}@${REPO_REF} para ${STACK_DIR}"
+$SUDO mkdir -p "$STACK_DIR"
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+curl -fsSL "https://codeload.github.com/${REPO_SLUG}/tar.gz/refs/heads/${REPO_REF}" \
+  | tar -xz -C "$TMP" --strip-components=1 \
+  || die "falha ao baixar o repositorio (${REPO_SLUG}@${REPO_REF})"
 
-$SUDO tee "$STACK_DIR/.env" >/dev/null <<ENV
-OPENSEARCH_VERSION=${OPENSEARCH_VERSION}
+# Preserva o .env existente: senhas ja aplicadas no indice de seguranca nao
+# podem ser trocadas so reescrevendo o arquivo.
+if [ -f "$STACK_DIR/.env" ]; then
+  log "  .env existente preservado"
+  $SUDO cp "$STACK_DIR/.env" "$TMP/.env"
+fi
+$SUDO cp -a "$TMP/." "$STACK_DIR/"
+$SUDO chmod +x "$STACK_DIR"/scripts/*.sh "$STACK_DIR"/install.sh "$STACK_DIR"/agent/*.sh 2>/dev/null || true
+
+# =========================== 3. .env ========================================
+if [ ! -f "$STACK_DIR/.env" ]; then
+  log "3/5  Gerando .env"
+  $SUDO tee "$STACK_DIR/.env" >/dev/null <<ENV
+OPENSEARCH_VERSION=${OPENSEARCH_VERSION:-3.8.0}
 CLUSTER_NAME=opensearch-cluster
 NODE_NAME=opensearch-node1
-OPENSEARCH_INITIAL_ADMIN_PASSWORD=${ADMIN_PASS}
-OPENSEARCH_JAVA_OPTS="-Xms512m -Xmx512m"
-OPENSEARCH_MEM_LIMIT=2g
+
+# Senha de BOOTSTRAP do usuario 'admin' (precisa passar no zxcvbn).
+OPENSEARCH_INITIAL_ADMIN_PASSWORD=${INITIAL_ADMIN_PASS}
+
+# Superusuario EFETIVO, criado pelo provisioner com all_access.
+OPENSEARCH_ADMIN_USER=${ADMIN_USER}
+OPENSEARCH_ADMIN_PASSWORD=${ADMIN_PASS}
+
+OPENSEARCH_JAVA_OPTS=-Xms1536m -Xmx1536m
+OPENSEARCH_MEM_LIMIT=3g
 DASHBOARDS_MEM_LIMIT=1g
+
 OPENSEARCH_PORT=9200
 OPENSEARCH_PERF_PORT=9600
 DASHBOARDS_PORT=5601
 ENROLL_PORT=80
+
+LLM_PROVIDER=${LLM_PROVIDER:-openrouter}
+LLM_ENDPOINT=${LLM_ENDPOINT:-https://openrouter.ai/api/v1/chat/completions}
+LLM_MODEL=${LLM_MODEL:-minimax/minimax-m3:free}
+LLM_API_KEY=${LLM_API_KEY:-coloque-sua-chave-openrouter-aqui}
+
+EMBEDDING_MODEL=${EMBEDDING_MODEL:-huggingface/sentence-transformers/all-MiniLM-L6-v2}
+EMBEDDING_VERSION=${EMBEDDING_VERSION:-1.0.2}
+
+AGENT_USER=${AGENT_USER}
+AGENT_PASS=${AGENT_PASS}
 ENV
-$SUDO chmod 600 "$STACK_DIR/.env"
+  $SUDO chmod 600 "$STACK_DIR/.env"
+else
+  log "3/5  .env ja existe - mantido como esta"
+fi
 
-$SUDO tee "$STACK_DIR/docker-compose.yml" >/dev/null <<'YAML'
-services:
-  opensearch:
-    image: opensearchproject/opensearch:${OPENSEARCH_VERSION}
-    container_name: opensearch-node
-    environment:
-      - cluster.name=${CLUSTER_NAME}
-      - node.name=${NODE_NAME}
-      - discovery.type=single-node
-      - bootstrap.memory_lock=true
-      - OPENSEARCH_JAVA_OPTS=${OPENSEARCH_JAVA_OPTS}
-      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
-      - DISABLE_SECURITY_PLUGIN=false
-      - DISABLE_INSTALL_DEMO_CONFIG=false
-    ulimits:
-      memlock: { soft: -1, hard: -1 }
-      nofile:  { soft: 65536, hard: 65536 }
-    volumes:
-      - opensearch-data:/usr/share/opensearch/data
-    ports:
-      - "${OPENSEARCH_PORT}:9200"
-      - "${OPENSEARCH_PERF_PORT}:9600"
-    networks: [opensearch-net]
-    deploy:
-      resources:
-        limits: { memory: "${OPENSEARCH_MEM_LIMIT}" }
-    healthcheck:
-      test:
-        - CMD-SHELL
-        - >-
-          curl -sk -u "admin:$${OPENSEARCH_INITIAL_ADMIN_PASSWORD}"
-          https://localhost:9200/_cluster/health
-          | grep -qE '"status":"(green|yellow)"'
-      interval: 10s
-      timeout: 10s
-      retries: 30
-      start_period: 60s
-    restart: unless-stopped
+# =========================== 4. SUBIR A STACK ===============================
+# O servico 'provisioner' do compose cria o superusuario, ativa as features
+# (setup-features.sh), cria o usuario de ingestao e provisiona IA (setup-ai.sh).
+# O Dashboards so sobe depois que ele termina com sucesso.
+log "4/5  Subindo os containers (o provisioner faz features + IA)"
+(cd "$STACK_DIR" && $SUDO docker compose up -d) || {
+  warn "Falha no 'compose up'. Log do provisioner:"
+  (cd "$STACK_DIR" && $SUDO docker compose logs --tail 40 provisioner) || true
+  die "provisionamento falhou"
+}
 
-  opensearch-dashboards:
-    image: opensearchproject/opensearch-dashboards:${OPENSEARCH_VERSION}
-    container_name: opensearch-dashboards
-    environment:
-      - OPENSEARCH_HOSTS=["https://opensearch:9200"]
-      - OPENSEARCH_USERNAME=admin
-      - OPENSEARCH_PASSWORD=${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
-      - OPENSEARCH_SSL_VERIFICATIONMODE=none
-      - SERVER_HOST=0.0.0.0
-      - SERVER_PORT=5601
-    volumes:
-      - opensearch-dashboards-data:/usr/share/opensearch-dashboards/data
-    ports:
-      - "${DASHBOARDS_PORT}:5601"
-    networks: [opensearch-net]
-    depends_on:
-      opensearch: { condition: service_healthy }
-    deploy:
-      resources:
-        limits: { memory: "${DASHBOARDS_MEM_LIMIT}" }
-    healthcheck:
-      test:
-        - CMD-SHELL
-        - >-
-          curl -sf -u "admin:$${OPENSEARCH_PASSWORD}"
-          http://localhost:5601/api/status
-          | grep -q '"state":"green"'
-      interval: 10s
-      timeout: 10s
-      retries: 30
-      start_period: 60s
-    restart: unless-stopped
-
-  enroll:
-    image: nginx:1.29-alpine
-    container_name: opensearch-enroll
-    volumes:
-      - ./agent:/usr/share/nginx/html:ro
-    ports:
-      - "${ENROLL_PORT}:80"
-    networks: [opensearch-net]
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost/install-agent.sh >/dev/null || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    restart: unless-stopped
-
-volumes:
-  opensearch-data:            { driver: local }
-  opensearch-dashboards-data: { driver: local }
-
-networks:
-  opensearch-net: { driver: bridge }
-YAML
-
-# =========================== 3. SUBIR A STACK ===============================
-log "3/6  Subindo os containers"
-(cd "$STACK_DIR" && $SUDO docker compose up -d)
-
-# =========================== 4. AGUARDAR SAUDE ==============================
-log "4/6  Aguardando OpenSearch e Dashboards ficarem healthy"
+# =========================== 5. VALIDACAO FINAL =============================
+log "5/5  Validando a stack"
 wait_health() {
   local name="$1" i st
-  for i in $(seq 1 60); do
+  for i in $(seq 1 90); do
     st=$($SUDO docker inspect --format='{{.State.Health.Status}}' "$name" 2>/dev/null || echo missing)
     [ "$st" = healthy ] && { log "$name: healthy"; return 0; }
-    [ "$st" = unhealthy ] && { $SUDO docker logs --tail 30 "$name"; die "$name ficou unhealthy"; }
     sleep 5
   done
-  die "Timeout aguardando $name"
+  warn "Timeout aguardando $name (siga com 'docker compose logs $name')"
 }
 wait_health opensearch-node
 wait_health opensearch-dashboards
 
-# =========================== 5. USUARIO DE INGESTAO + FEATURES + AI =======
-log "5/7  Criando usuario de ingestao '${AGENT_USER}' (permissao só em logs-*)"
-api() { curl -sk -u "admin:${ADMIN_PASS}" -H 'Content-Type: application/json' "$@"; }
-api -XPUT "https://localhost:9200/_plugins/_security/api/roles/agent-ingest-role" -d '{
-  "cluster_permissions":["cluster_composite_ops","cluster_monitor","indices:data/write/bulk"],
-  "index_permissions":[{"index_patterns":["logs-*"],
-    "allowed_actions":["crud","create_index","indices:admin/mapping/put","indices:admin/mapping/auto_put"]}]
-}' >/dev/null
-api -XPUT "https://localhost:9200/_plugins/_security/api/internalusers/${AGENT_USER}" \
-    -d "{\"password\":\"${AGENT_PASS}\"}" >/dev/null
-api -XPUT "https://localhost:9200/_plugins/_security/api/rolesmapping/agent-ingest-role" \
-    -d "{\"users\":[\"${AGENT_USER}\"]}" >/dev/null
-code=$(curl -sk -o /dev/null -w '%{http_code}' -u "${AGENT_USER}:${AGENT_PASS}" https://localhost:9200/_cluster/health)
-[ "$code" = 200 ] && log "usuario ${AGENT_USER} valida (HTTP 200)" || warn "usuario de ingestao respondeu HTTP $code"
-
-# Ativa TODOS os plugins oficiais (alerting, anomaly, ml_commons, ISM, etc.)
-log "5b/7  Ativando plugins oficiais (alerting, anomaly, ML Commons, ISM, observability)"
-( cd "$STACK_DIR" && $SUDO OS_ADMIN_PASS="${ADMIN_PASS}" AGENT_USER="${AGENT_USER}" \
-    AGENT_PASS="${AGENT_PASS}" bash scripts/setup-features.sh ) || warn "Falha ativando plugins (seguindo)."
-
-# Provisiona o stack de IA (root agent OpenRouter + embeddings + tools)
-if [ -n "${LLM_API_KEY:-}" ]; then
-  log "5c/7  Provisionando IA / Agentic / LLM (connector OpenRouter + root agent)"
-  ( cd "$STACK_DIR" && $SUDO bash -c "
-    set -a; . ./.env; set +a
-    OS_ADMIN_PASS='${ADMIN_PASS}' \
-    bash scripts/setup-ai.sh
-  " ) || warn "Falha no setup de IA (verifique LLM_API_KEY). Pode reexecutar depois."
-else
-  warn "LLM_API_KEY nao definido - pulei setup de IA. Defina no .env e rode scripts/setup-ai.sh depois."
-fi
-
-# =========================== 7. VALIDACAO FINAL =============================
-log "7/7  Validando a stack"
-curl -sk -u "admin:${ADMIN_PASS}" https://localhost:9200 | grep -q '"number"' \
-  && log "API OpenSearch responde com autenticacao" || die "API nao respondeu"
-curl -sk -o /dev/null -w '%{http_code}' https://localhost:9200 | grep -q 401 \
-  && log "Acesso anonimo bloqueado (401) - seguranca ativa" || warn "Acesso anonimo NAO retornou 401"
+curl -sk -u "${ADMIN_USER}:${ADMIN_PASS}" https://localhost:9200 | grep -q '"number"' \
+  && log "API responde com o superusuario '${ADMIN_USER}'" \
+  || warn "API nao respondeu com '${ADMIN_USER}' - veja 'docker compose logs provisioner'"
+[ "$(curl -sk -o /dev/null -w '%{http_code}' https://localhost:9200)" = 401 ] \
+  && log "Acesso anonimo bloqueado (401) - seguranca ativa" \
+  || warn "Acesso anonimo NAO retornou 401"
 
 IP=$(hostname -I | awk '{print $1}')
 cat <<FIM
 
 ===========================================================================
- Stack OpenSearch ${OPENSEARCH_VERSION} provisionada
+ Stack OpenSearch provisionada
 ---------------------------------------------------------------------------
- Dashboards   : http://${IP}:5601        (admin / ${ADMIN_PASS})
+ Dashboards   : http://${IP}:5601        (${ADMIN_USER} / ${ADMIN_PASS})
  API          : https://${IP}:9200       (TLS autoassinado, use curl -k)
  Diretorio    : ${STACK_DIR}
 
@@ -242,8 +169,8 @@ cat <<FIM
    Windows : irm http://${IP}/install-agent.ps1 | iex
 
  Operacao:
-   docker compose -f ${STACK_DIR}/docker-compose.yml ps
-   docker compose -f ${STACK_DIR}/docker-compose.yml logs -f
+   cd ${STACK_DIR} && docker compose ps
+   cd ${STACK_DIR} && docker compose logs -f provisioner
    ${STACK_DIR}/install.sh --uninstall     # para a stack, mantem dados
    ${STACK_DIR}/install.sh --purge         # para a stack e APAGA os dados
 ===========================================================================

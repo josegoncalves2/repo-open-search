@@ -1,52 +1,97 @@
-# Stack OpenSearch — single-node, segurança ativa, IA + Agentic
+# Stack OpenSearch — single-node, segurança ativa, IA + Agentic + LLM
 
-Stack completa do OpenSearch **3.8.0** (versão `latest` estável em 2026-09-03)
-com OpenSearch Dashboards, Fluent Bit, NGINX (enroll) e provisionamento
-automático de **IA generativa / Agentic / LLM**.
+Stack completa do **OpenSearch 3.8.0** (versão estável mais recente segundo
+[opensearch.org/downloads](https://opensearch.org/downloads/), lançada em
+2026-08-05) com OpenSearch Dashboards, provisionamento automático de
+**IA generativa / Agentic / LLM** e enroll de agentes Linux/Windows.
+
+> **Nota sobre a versão:** o prompt original pedia "2.x". A linha 2.x ainda
+> recebe patches (2.19.6), mas a série estável atual é a **3.x** — esta stack
+> usa 3.8.0. Para fixar 2.x, basta `OPENSEARCH_VERSION=2.19.6` no `.env`.
 
 ## Recursos habilitados
 
 | Categoria | Plugin / Recurso | Status |
 |---|---|---|
 | Core | OpenSearch + Dashboards 3.8.0 | ✅ |
-| Segurança | TLS + autenticação por senha (admin + agent-ingest) | ✅ |
+| Segurança | TLS + autenticação por senha (`pmotiadm` + `agent-ingest`) | ✅ |
 | Segurança | Security Analytics (detecção de ameaças) | ✅ |
 | Observability | Index Patterns, Logs, Metrics, Traces | ✅ |
 | Observability | Query Assistant (texto → PPL) | ✅ |
 | Alertas | Alerting + Notifications | ✅ |
 | ML | Anomaly Detection (AD) | ✅ |
-| ML | ML Commons (modelos, pipelines, RAG) | ✅ |
-| ML | k-NN (busca vetorial) | ✅ |
+| ML | ML Commons (modelos, pipelines, RAG, memória) | ✅ |
+| ML | k-NN + Neural Search (busca vetorial) | ✅ |
 | IA generativa | OpenSearch Assistant (chat, text2viz, alertInsight, anomaly insights) | ✅ |
-| Agentic | Root agent (ListIndex / Search / VectorDB / PPL / CatIndex) | ✅ |
-| LLM | OpenRouter (modelo `minimax/minimax-m3:free`) via connector OpenAI-compatible | ✅ |
-| Embeddings | Hugging Face sentence-transformers (384 dim) — local no cluster | ✅ |
+| Agentic | Root agent conversacional (ListIndex / IndexMapping / SearchIndex / VectorDB / PPL) | ✅ |
+| LLM | OpenRouter (`minimax/minimax-m3:free`) via connector OpenAI-compatible | ✅ |
+| Embeddings | `all-MiniLM-L6-v2` (384 dim) — local no cluster | ✅ |
 | Index Management | ISM policies (rollover, retenção, snapshots) | ✅ |
 | Agentes | Fluent Bit (Linux/Windows) enviando para `logs-<host>` | ✅ |
-| Enroll | NGINX publicando scripts `install-agent.{sh,ps1}` | ✅ |
+| Enroll | NGINX publicando `install-agent.{sh,ps1}` | ✅ |
 
-## Senha do admin
+Verificado em cold start (`docker compose down -v && docker compose up -d`):
+cluster `green`, 26 plugins ativos, agent respondendo em linguagem natural.
 
-- **Pedida**: `pmotiadm` (radical)
-- **Aplicada**: `PmoT1Adm@2026#SecureKey` (reforçada para passar no `zxcvbn`
-  do OpenSearch 2.12+; sem caracteres de escape que quebrariam o YAML do Compose)
+## Versões das imagens
+
+| Imagem | Versão | Observação |
+|---|---|---|
+| `opensearchproject/opensearch` | `3.8.0` | última estável |
+| `opensearchproject/opensearch-dashboards` | `3.8.0` | casada com o core |
+| `alpine` (provisioner) | `3.24` | última estável |
+| `nginx` (enroll) | `1.31-alpine` | linha mainline atual |
+
+## Credenciais
+
+| Conta | Uso | Senha |
+|---|---|---|
+| `pmotiadm` | **superusuário efetivo** — login no Dashboards e na API | `pmotiadm` |
+| `admin` | conta de bootstrap/emergência (reservada no OpenSearch 3.x) | `OPENSEARCH_INITIAL_ADMIN_PASSWORD` do `.env` |
+| `agent-ingest` | ingestão dos agentes Fluent Bit (só `logs-*`) | `AGENT_PASS` do `.env` |
+
+> ⚠️ `pmotiadm/pmotiadm` é uma senha fraca, adequada apenas a laboratório.
+> Para expor esta stack fora do host, troque `OPENSEARCH_ADMIN_PASSWORD` no
+> `.env` e rode `docker compose up -d` de novo.
+
+### Como a senha fraca é aplicada
+
+A Security REST API valida a força da senha com **zxcvbn** e rejeita
+`pmotiadm` com `{"status":"error","reason":"Weak password"}`. Não há como
+desligar essa checagem:
+
+| Tentativa | Resultado |
+|---|---|
+| `plugins.security.restapi.password_validation_regex=(.*)` | afrouxa só a **regex**, não o score |
+| `..._password_score_based_validation_strength=weak` | o parser **não aceita** `weak` (piso: `fair`) |
+| criar com senha forte e trocar via `PUT _plugins/_security/api/account` | cai no **mesmo** validador — também rejeita |
+| **enviar `hash` bcrypt em vez de `password`** | ✅ **funciona** — o validador só inspeciona `password` |
+
+O `scripts/lib.sh` gera o bcrypt com `htpasswd -bnBC 12` e o `provision.sh`
+cria o usuário com `{"hash": "$2y$12$..."}`. Ver comentários em
+[`scripts/lib.sh`](scripts/lib.sh).
 
 ## Estrutura
 
 | Arquivo | Função |
 |---|---|
-| `docker-compose.yml` | Stack: OpenSearch + Dashboards + enroll |
-| `.env` | Versão, senhas, heap, limites de memória, portas, LLM |
-| `.env.agent` | Credenciais reais do `agent-ingest` (NÃO vai pro Git) |
-| `.env.agent.example` | Modelo das credenciais de ingestão |
-| `config/opensearch.yml` | Config principal do nó (todos os plugins ativos) |
-| `config/opensearch_dashboards.yml` | Config Dashboards (Assistant + dashboards de ML) |
-| `install.sh` | Provisionamento completo em host novo |
+| `docker-compose.yml` | Stack: OpenSearch + provisioner + Dashboards + enroll |
+| `.env` | Versão, senhas, heap, limites, portas, LLM (**não vai pro Git**) |
+| `.env.example` | Modelo do `.env` |
+| `config/opensearch_dashboards.yml` | Config do Dashboards (Assistant, Query Assist) |
+| `install.sh` | Instalação em host novo (baixa o repo e sobe a stack) |
+| `scripts/lib.sh` | Helpers — geração de bcrypt e criação de usuários |
+| `scripts/provision.sh` | Orquestra o provisionamento pós-boot (roda no container) |
+| `scripts/setup-features.sh` | Ativa features dinâmicas via cluster settings |
+| `scripts/setup-agent-user.sh` | Cria usuário/role de ingestão (`logs-*`) |
+| `scripts/setup-ai.sh` | Connector + modelos + root agent (IA/Agentic/LLM) |
 | `agent/install-agent.sh` | Enroll Linux (Fluent Bit) |
 | `agent/install-agent.ps1` | Enroll Windows (Fluent Bit) |
-| `scripts/setup-agent-user.sh` | Cria usuário de ingestão (logs-*) |
-| `scripts/setup-features.sh` | Ativa plugins via cluster settings |
-| `scripts/setup-ai.sh` | Provisiona connector, modelos e root agent |
+
+> Não existe `config/opensearch.yml` de propósito: montar um arquivo com
+> `plugins.security.*` faz o instalador demo **pular a geração dos
+> certificados TLS**, e o nó sobe com "No SSL configuration found". Os
+> settings do nó vão como variáveis de ambiente no `docker-compose.yml`.
 
 ## 1. Pré-requisito do host
 
@@ -56,75 +101,102 @@ echo 'vm.max_map_count=262144' | sudo tee /etc/sysctl.d/99-opensearch.conf
 sudo sysctl --system
 ```
 
-Recursos: **≥ 4 GB RAM** e 2 vCPU. Heap da JVM em 1.5 GB (`OPENSEARCH_JAVA_OPTS`).
+Recursos: **≥ 4 GB RAM** e 2 vCPU. Heap da JVM em 1.5 GB (`OPENSEARCH_JAVA_OPTS`)
+— os modelos de ML precisam de folga além dos 512 MB do exemplo básico.
 
 ## 2. Subir a stack
 
 ```bash
-cd /opt/projetos/openstack
+cp .env.example .env      # ajuste LLM_API_KEY
 docker compose up -d
-docker compose ps        # todos "healthy"
+docker compose ps         # todos "healthy"
 ```
 
-Instalação em host novo:
+Instalação em host novo (baixa o repositório inteiro e provisiona):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/josegoncalves2/repo-open-search/main/install.sh | bash
 ```
 
+### Ordem de subida
+
+O serviço `provisioner` roda **uma vez**, depois que o OpenSearch fica
+`healthy`, e o Dashboards só inicia quando ele termina com sucesso:
+
+1. cria o superusuário `pmotiadm` (hash bcrypt) com `all_access`
+2. `setup-features.sh` — features dinâmicas + verificação
+3. `setup-agent-user.sh` — usuário de ingestão
+4. `setup-ai.sh` — connector, modelos, root agent, teste real do agent
+
 ## 3. Acesso
 
 | Serviço | Endereço | Credenciais |
 |---|---|---|
-| Dashboards | http://localhost:5601 | `admin` / `PmoT1Adm@2026#SecureKey` |
+| Dashboards | http://localhost:5601 | `pmotiadm` / `pmotiadm` |
 | API OpenSearch | https://localhost:9200 | idem (TLS autoassinado → `curl -k`) |
 | Enroll | http://localhost/ | público |
 
 ```bash
-curl -k -u admin:'PmoT1Adm@2026#SecureKey' https://localhost:9200
+curl -k -u pmotiadm:pmotiadm https://localhost:9200
 ```
 
 ## 4. Verificação de IA / Agentic / LLM
 
 ```bash
-# Connector criado
-curl -k -u admin:'PmoT1Adm@2026#SecureKey' \
-  https://localhost:9200/_plugins/_ml/connectors/_search | jq '.hits.hits[]._name'
+A='pmotiadm:pmotiadm'; OS=https://localhost:9200
 
-# Modelos registrados
-curl -k -u admin:'PmoT1Adm@2026#SecureKey' \
-  https://localhost:9200/_plugins/_ml/models/_search | jq '.hits.hits[]._name'
+# Root agent registrado para o Assistant
+AID=$(curl -sk -u $A $OS/_plugins/_ml/config/os_chat | jq -r .configuration.agent_id)
 
-# Root agent (OpenSearch Assistant)
-curl -k -u admin:'PmoT1Adm@2026#SecureKey' \
-  https://localhost:9200/_plugins/_ml/agents/_search | jq '.hits.hits[]._name'
+# Pergunta real (Agentic + LLM + tools)
+curl -sk -u $A -H 'Content-Type: application/json' \
+  -XPOST "$OS/_plugins/_ml/agents/$AID/_execute" \
+  -d '{"parameters":{"question":"Liste os indices deste cluster."}}' \
+  | jq -r '.inference_results[0].output[]|select(.name=="response")|.dataAsMap.response'
 
-# Chat de teste
-curl -k -u admin:'PmoT1Adm@2026#SecureKey' \
-  -H 'Content-Type: application/json' \
-  -XPOST 'https://localhost:9200/_plugins/_ml/agents/<agent_id>/_execute' \
-  -d '{"parameters":{"question":"Liste os índices do cluster"}}'
+# Embeddings (neural search / RAG)
+EMB=$(curl -sk -u $A -H 'Content-Type: application/json' "$OS/_plugins/_ml/models/_search" \
+  -d '{"size":1,"query":{"bool":{"must":[{"term":{"algorithm":"TEXT_EMBEDDING"}},{"term":{"model_state":"DEPLOYED"}}]}}}' \
+  | jq -r '.hits.hits[0]._id')
+curl -sk -u $A -H 'Content-Type: application/json' \
+  -XPOST "$OS/_plugins/_ml/_predict/text_embedding/$EMB" \
+  -d '{"text_docs":["busca semantica"],"target_response":["sentence_embedding"]}' | jq '.inference_results[0].output[0].shape'
 ```
 
-No Dashboards: **Stack Management → Plugins → Assistant** — o campo "Root
-agent" aponta para o ID retornado acima.
+No Dashboards: ícone do **Assistant** (chat) e **Observability → Query Assist**.
+
+### Detalhes que quebram silenciosamente
+
+- **`CatIndexTool` não existe no OpenSearch 3.8.** O `_register` do agent
+  aceita a tool, mas o `_execute` falha com `"Tool type not found"`. O
+  `setup-ai.sh` monta a lista de tools a partir de `GET /_plugins/_ml/tools`,
+  então só entra o que o cluster realmente expõe.
+- **O agent conversacional não envia `parameters.messages`.** Ele monta o
+  prompt (ReAct + histórico + tools) em `parameters.prompt`. Um connector com
+  `"messages": ${parameters.messages}` registra e funciona no `_predict`
+  manual, mas o `_execute` falha com `Invalid payload`. O connector monta o
+  array `messages` a partir de `${parameters.prompt}`.
+- **`.plugins-ml-*` são system indices protegidos** — nem `all_access` escreve
+  neles, o que impede registrar o root agent em `.plugins-ml-config`. A stack
+  liga `plugins.security.system_indices.permission.enabled=true` e cria a role
+  `ml-config-writer` com `system:admin/system_index` em `.plugins-ml-*`.
+  O escopo tem de ser `.plugins-ml-*`: restringir a `.plugins-ml-config` faz
+  o próprio `_plugins/_ml/models/_search` retornar 403.
 
 ## 5. Operação
 
 ```bash
 docker compose ps
+docker compose logs -f provisioner   # o que foi provisionado
 docker compose logs -f opensearch
-docker compose restart opensearch-dashboards
-docker compose down      # volumes preservados
-docker compose down -v   # APAGA volumes
+docker compose down                  # volumes preservados
+docker compose down -v               # APAGA volumes
 ```
 
-Reativar features / IA manualmente:
+Reexecutar o provisionamento (idempotente):
 
 ```bash
-cd /opt/projetos/openstack
-OS_ADMIN_PASS='PmoT1Adm@2026#SecureKey' bash scripts/setup-features.sh
-bash scripts/setup-ai.sh   # usa .env
+docker compose up -d --force-recreate provisioner
 ```
 
 ## 6. Enroll de agentes
@@ -146,22 +218,27 @@ irm http://localhost/install-agent.ps1 | iex
 Conferir ingestão:
 
 ```bash
-curl -k -u admin:'PmoT1Adm@2026#SecureKey' \
-  'https://localhost:9200/_cat/indices/logs-*?v'
+curl -k -u pmotiadm:pmotiadm 'https://localhost:9200/_cat/indices/logs-*?v'
 ```
 
 ## 7. Troubleshooting
 
-**`OPENSEARCH_INITIAL_ADMIN_PASSWORD` inválida** — tem que ter ≥ 8 chars,
-maiúscula, minúscula, número e especial, **e** passar no `zxcvbn` (a
-biblioteca bloqueia padrões como `pmotiadm`, datas, sequências, etc.).
+**`Weak password` ao criar usuário** — use hash bcrypt em vez de senha em
+texto puro; ver [Como a senha fraca é aplicada](#como-a-senha-fraca-é-aplicada).
 
-**Dashboards fica `unhealthy` mas a interface funciona** — o healthcheck manda
-`/api/status` com `-u admin:$OPENSEARCH_PASSWORD`. Verifique se a senha bate.
+**Provisioner sai com erro logo após o boot** — o ML Commons pode não estar
+pronto. O `setup-ai.sh` já faz 10 tentativas na criação do connector; se ainda
+falhar, `docker compose up -d --force-recreate provisioner`.
 
-**Plugins não aparecem ativos** — rode `scripts/setup-features.sh` (idempotente).
-Como a config está em `opensearch.yml` montado via volume, basta um
-`docker compose restart opensearch`.
+**`Nenhuma credencial conhecida autentica`** — o volume tem um índice de
+segurança antigo com outra senha. `docker compose down -v` e suba de novo.
+
+**Dashboards `unhealthy` mas a interface funciona** — o healthcheck usa
+`OPENSEARCH_USERNAME`/`OPENSEARCH_PASSWORD` contra `/api/status`. Confira se
+batem com o `.env`.
 
 **LLM não responde** — verifique `LLM_API_KEY` no `.env`, conectividade HTTPS
-ao OpenRouter e logs do OpenSearch (`docker compose logs opensearch | grep -i ml`).
+ao OpenRouter e `docker compose logs opensearch | grep -i ml`.
+
+**Container encerra com Exit 137** — `vm.max_map_count` ou RAM insuficiente
+(ver seção 1).

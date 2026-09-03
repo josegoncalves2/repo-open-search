@@ -6,6 +6,8 @@
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
+. "$(dirname "$0")/lib.sh"
+
 OS_URL="${OS_URL:-https://localhost:9200}"
 OS_ADMIN_USER="${OS_ADMIN_USER:-admin}"
 OS_ADMIN_PASS="${OS_ADMIN_PASS:?defina OS_ADMIN_PASS}"
@@ -32,12 +34,11 @@ api -XPUT "${OS_URL}/_plugins/_security/api/roles/agent-ingest-role" -d '{
   }]
 }' | head -c 300; echo
 
+# Senha via hash bcrypt: nao passa pelo validador zxcvbn da Security REST API,
+# entao AGENT_PASS pode ser qualquer coisa sem quebrar o provisionamento.
 echo "==> criando usuario interno '${AGENT_USER}'"
-api -XPUT "${OS_URL}/_plugins/_security/api/internalusers/${AGENT_USER}" -d "{
-  \"password\": \"${AGENT_PASS}\",
-  \"backend_roles\": [],
-  \"attributes\": {\"purpose\": \"log ingestion agent\"}
-}" | head -c 300; echo
+put_internal_user "$OS_URL" "${OS_ADMIN_USER}:${OS_ADMIN_PASS}" "$AGENT_USER" "$AGENT_PASS" \
+  '"backend_roles":[],"attributes":{"purpose":"log ingestion agent"}' | head -c 300; echo
 
 echo "==> mapeando usuario -> role"
 api -XPUT "${OS_URL}/_plugins/_security/api/rolesmapping/agent-ingest-role" -d "{

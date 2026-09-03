@@ -6,20 +6,39 @@ services:
       - cluster.name=${CLUSTER_NAME}
       - node.name=${NODE_NAME}
       - discovery.type=single-node
-      # role 'ml' obrigatoria para deploy de modelos neste no unico
+      # role 'ml' obrigatoria para deploy de modelos de IA neste no unico
       - node.roles=cluster_manager,data,ingest,remote_cluster_client,ml
       - bootstrap.memory_lock=true
       - OPENSEARCH_JAVA_OPTS=${OPENSEARCH_JAVA_OPTS}
+      # senha de BOOTSTRAP: so inicializa o indice de seguranca no 1o start
+      # (tem de passar no zxcvbn). Depois o provisioner troca admin -> senha final.
       - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
       - DISABLE_SECURITY_PLUGIN=false
+      # deixa o instalador demo gerar os certificados TLS + config de seguranca.
+      # (por isso NAO montamos um opensearch.yml com 'plugins.security.*': isso
+      #  faz o instalador pular a geracao de certs -> "No SSL configuration found")
       - DISABLE_INSTALL_DEMO_CONFIG=false
+      # ---- features de IA / Agentic / LLM como node settings (via env) --------
+      - plugins.ml_commons.agent_framework_enabled=true
+      - plugins.ml_commons.rag_pipeline_feature_enabled=true
+      - plugins.ml_commons.memory_feature_enabled=true
+      - plugins.ml_commons.only_run_on_ml_node=false
+      - plugins.ml_commons.allow_registering_model_via_url=true
+      - plugins.ml_commons.native_memory_threshold=100
+      - plugins.ml_commons.jvm_heap_memory_threshold=100
+      # Permite que roles recebam 'system:admin/system_index'. Necessario para
+      # gravar o root agent do Assistant em .plugins-ml-config (setup-ai.sh).
+      # Sem isso, nem o all_access escreve nesse indice (403 security_exception).
+      - plugins.security.system_indices.permission.enabled=true
+      # NOTA: nao adiantam 'password_validation_regex' nem
+      # 'password_score_based_validation_strength' para permitir senha fraca -
+      # o piso do score e 'fair'. A senha final e aplicada como HASH bcrypt
+      # pelo provisioner (ver scripts/lib.sh).
     ulimits:
       memlock: { soft: -1, hard: -1 }
       nofile:  { soft: 65536, hard: 65536 }
     volumes:
       - opensearch-data:/usr/share/opensearch/data
-      # config principal com TODOS os plugins oficiais ativos
-      - ./config/opensearch.yml:/usr/share/opensearch/config/opensearch.yml:ro
     ports:
       - "${OPENSEARCH_PORT}:9200"
       - "${OPENSEARCH_PERF_PORT}:9600"
@@ -28,25 +47,58 @@ services:
       resources:
         limits: { memory: "${OPENSEARCH_MEM_LIMIT}" }
     healthcheck:
+      # desacoplado da senha: 200 (sem seguranca) ou 401 (seguranca no ar) = vivo
       test:
         - CMD-SHELL
         - >-
-          curl -sk -u "admin:$${OPENSEARCH_INITIAL_ADMIN_PASSWORD}"
-          https://localhost:9200/_cluster/health
-          | grep -qE '"status":"(green|yellow)"'
+          c=$$(curl -sk -o /dev/null -w '%{http_code}' https://localhost:9200);
+          [ "$$c" = 200 ] || [ "$$c" = 401 ]
       interval: 10s
       timeout: 10s
-      retries: 30
+      retries: 40
       start_period: 60s
     restart: unless-stopped
+
+  # -----------------------------------------------------------------------
+  # Provisiona a stack apos o OpenSearch subir:
+  #   1. troca a senha do admin para a senha final (OPENSEARCH_ADMIN_PASSWORD)
+  #   2. ativa todas as features oficiais (setup-features.sh)
+  #   3. cria o usuario de ingestao dos agentes (setup-agent-user.sh)
+  #   4. provisiona IA / Agentic / LLM: connector, modelos, root agent (setup-ai.sh)
+  # Roda uma vez e sai 0. O Dashboards so inicia depois deste passo.
+  # -----------------------------------------------------------------------
+  provisioner:
+    image: alpine:3.24
+    container_name: opensearch-provisioner
+    depends_on:
+      opensearch: { condition: service_healthy }
+    environment:
+      - OS_URL=https://opensearch:9200
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
+      - OPENSEARCH_ADMIN_USER=${OPENSEARCH_ADMIN_USER}
+      - OPENSEARCH_ADMIN_PASSWORD=${OPENSEARCH_ADMIN_PASSWORD}
+      - AGENT_USER=${AGENT_USER}
+      - AGENT_PASS=${AGENT_PASS}
+      - LLM_PROVIDER=${LLM_PROVIDER}
+      - LLM_ENDPOINT=${LLM_ENDPOINT}
+      - LLM_MODEL=${LLM_MODEL}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL}
+      - EMBEDDING_VERSION=${EMBEDDING_VERSION}
+    volumes:
+      - ./scripts:/scripts:ro
+    command: >-
+      sh -c "apk add --no-cache bash curl jq apache2-utils >/dev/null && bash /scripts/provision.sh"
+    networks: [opensearch-net]
+    restart: "no"
 
   opensearch-dashboards:
     image: opensearchproject/opensearch-dashboards:${OPENSEARCH_VERSION}
     container_name: opensearch-dashboards
     environment:
       - OPENSEARCH_HOSTS=["https://opensearch:9200"]
-      - OPENSEARCH_USERNAME=admin
-      - OPENSEARCH_PASSWORD=${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
+      - OPENSEARCH_USERNAME=${OPENSEARCH_ADMIN_USER}
+      - OPENSEARCH_PASSWORD=${OPENSEARCH_ADMIN_PASSWORD}
       - OPENSEARCH_SSL_VERIFICATIONMODE=none
       - SERVER_HOST=0.0.0.0
       - SERVER_PORT=5601
@@ -57,7 +109,8 @@ services:
       - "${DASHBOARDS_PORT}:5601"
     networks: [opensearch-net]
     depends_on:
-      opensearch: { condition: service_healthy }
+      opensearch:  { condition: service_healthy }
+      provisioner: { condition: service_completed_successfully }
     deploy:
       resources:
         limits: { memory: "${DASHBOARDS_MEM_LIMIT}" }
@@ -65,17 +118,17 @@ services:
       test:
         - CMD-SHELL
         - >-
-          curl -sf -u "admin:$${OPENSEARCH_PASSWORD}"
+          curl -sf -u "$${OPENSEARCH_USERNAME}:$${OPENSEARCH_PASSWORD}"
           http://localhost:5601/api/status
           | grep -q '"state":"green"'
       interval: 10s
       timeout: 10s
       retries: 30
-      start_period: 60s
+      start_period: 90s
     restart: unless-stopped
 
   enroll:
-    image: nginx:1.29-alpine
+    image: nginx:1.31-alpine
     container_name: opensearch-enroll
     volumes:
       - ./agent:/usr/share/nginx/html:ro

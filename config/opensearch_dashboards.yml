@@ -1,4 +1,15 @@
 ---
+# ===========================================================================
+# opensearch_dashboards.yml — OpenSearch Dashboards 3.8.0
+# Montado em /usr/share/opensearch-dashboards/config/ via docker-compose.
+#
+# REGRA: só entram aqui chaves que existem no schema dos plugins desta versão.
+# Uma única chave desconhecida faz o Dashboards abortar no boot
+# (ValidationError: "definition for this key is missing").
+# Os plugins de ML/Alerting/Anomaly/ISM/Notifications já vêm ATIVOS por padrão;
+# não é preciso — nem válido — "ligá-los" via *.dashboards.enabled.
+# ===========================================================================
+
 server.host: '0.0.0.0'
 server.port: 5601
 
@@ -14,27 +25,16 @@ opensearch_security.readonly_mode.roles: [kibana_read_only]
 opensearch_security.cookie.secure: false
 
 # --------------------------------------------------------------------------
-# OpenSearch Assistant (IA generativa no Dashboards)
-# Requer um root agent registrado no ML Commons (feito por scripts/setup-ai.sh)
+# OpenSearch Assistant — IA generativa no Dashboards
+# (todas as chaves abaixo vêm `false` por padrão; requerem o root agent
+#  registrado no ML Commons — feito por scripts/setup-ai.sh)
 # --------------------------------------------------------------------------
-assistant.chat.enabled: true               # chat conversacional
-assistant.next.enabled: true               # nova experiencia do assistant
-assistant.text2viz.enabled: true           # linguagem natural -> visualizacao
-assistant.alertInsight.enabled: true       # explicacao de alertas por IA
-assistant.smartAnomalyDetector.enabled: true
-assistant.incontextInsight.enabled: true
-assistant.branding.enabled: true
+assistant.chat.enabled: true                 # chat conversacional (janela do Assistant)
+assistant.next.enabled: true                 # nova experiência "Assistant"
+assistant.text2viz.enabled: true             # linguagem natural -> visualização
+assistant.alertInsight.enabled: true         # explicação de alertas por IA
+assistant.smartAnomalyDetector.enabled: true # sugestão de detectores de anomalia
+assistant.incontextInsight.enabled: true     # insights contextuais (padrão já true)
 
-# Query Assistant do Observability (texto -> PPL)
+# Query Assistant do Observability (texto -> PPL/consulta)
 observability.query_assist.enabled: true
-
-# Dashboards do ML Commons (modelos, agentes, pipelines RAG)
-ml_commons.dashboards.enabled: true
-ml_commons.agent_framework.enabled: true
-
-# Notificacoes (canais e UI de alerting)
-notifications.dashboards.enabled: true
-alerting.dashboards.enabled: true
-anomaly_detection.dashboards.enabled: true
-index_management.dashboards.enabled: true
-observability.dashboards.enabled: true
