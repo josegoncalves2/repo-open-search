@@ -1,0 +1,22 @@
+# Segredos e estado local - nunca vao para o repositorio
+.env
+.env.agent
+.env.agent.local
+
+# Volumes e dados do Docker
+**/data/
+**/opensearch-data/
+**/opensearch-dashboards-data/
+
+# Arquivos do SO
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Logs e estado
+*.log
+*.swp
+*.bak

@@ -1,0 +1,40 @@
+---
+server.host: '0.0.0.0'
+server.port: 5601
+
+opensearch.hosts: [https://opensearch:9200]
+opensearch.ssl.verificationMode: none
+opensearch.username: kibanaserver
+opensearch.password: kibanaserver
+opensearch.requestHeadersWhitelist: [authorization, securitytenant]
+
+opensearch_security.multitenancy.enabled: true
+opensearch_security.multitenancy.tenants.preferred: [Private, Global]
+opensearch_security.readonly_mode.roles: [kibana_read_only]
+opensearch_security.cookie.secure: false
+
+# --------------------------------------------------------------------------
+# OpenSearch Assistant (IA generativa no Dashboards)
+# Requer um root agent registrado no ML Commons (feito por scripts/setup-ai.sh)
+# --------------------------------------------------------------------------
+assistant.chat.enabled: true               # chat conversacional
+assistant.next.enabled: true               # nova experiencia do assistant
+assistant.text2viz.enabled: true           # linguagem natural -> visualizacao
+assistant.alertInsight.enabled: true       # explicacao de alertas por IA
+assistant.smartAnomalyDetector.enabled: true
+assistant.incontextInsight.enabled: true
+assistant.branding.enabled: true
+
+# Query Assistant do Observability (texto -> PPL)
+observability.query_assist.enabled: true
+
+# Dashboards do ML Commons (modelos, agentes, pipelines RAG)
+ml_commons.dashboards.enabled: true
+ml_commons.agent_framework.enabled: true
+
+# Notificacoes (canais e UI de alerting)
+notifications.dashboards.enabled: true
+alerting.dashboards.enabled: true
+anomaly_detection.dashboards.enabled: true
+index_management.dashboards.enabled: true
+observability.dashboards.enabled: true

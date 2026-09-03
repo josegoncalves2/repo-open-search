@@ -1,0 +1,122 @@
+# ---------------------------------------------------------------------------
+# OpenSearch + OpenSearch Dashboards - single-node com seguranca habilitada
+# Todas as versoes/senhas/portas vem do arquivo .env
+# ---------------------------------------------------------------------------
+
+services:
+  opensearch:
+    image: opensearchproject/opensearch:${OPENSEARCH_VERSION}
+    container_name: opensearch-node
+    environment:
+      - cluster.name=${CLUSTER_NAME}
+      - node.name=${NODE_NAME}
+      - discovery.type=single-node
+      # role 'ml' e obrigatoria para deploy de modelos neste no unico
+      - node.roles=cluster_manager,data,ingest,remote_cluster_client,ml
+      - bootstrap.memory_lock=true
+      - OPENSEARCH_JAVA_OPTS=${OPENSEARCH_JAVA_OPTS}
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
+      # plugin de seguranca ATIVO (TLS + autenticacao por senha)
+      - DISABLE_SECURITY_PLUGIN=false
+      - DISABLE_INSTALL_DEMO_CONFIG=false
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+      - ./config/opensearch.yml:/usr/share/opensearch/config/opensearch.yml:ro
+    ports:
+      - "${OPENSEARCH_PORT}:9200"
+      - "${OPENSEARCH_PERF_PORT}:9600"
+    networks:
+      - opensearch-net
+    deploy:
+      resources:
+        limits:
+          memory: ${OPENSEARCH_MEM_LIMIT}
+    healthcheck:
+      # Usa /_cluster/health: independe da tagline, que mudou entre 2.x e 3.x.
+      # $$ escapa o $ para que a variavel seja expandida DENTRO do container.
+      test:
+        - CMD-SHELL
+        - >-
+          curl -sk -u "admin:$${OPENSEARCH_INITIAL_ADMIN_PASSWORD}"
+          https://localhost:9200/_cluster/health
+          | grep -qE '"status":"(green|yellow)"'
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+    restart: unless-stopped
+
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:${OPENSEARCH_VERSION}
+    container_name: opensearch-dashboards
+    environment:
+      - OPENSEARCH_HOSTS=["https://opensearch:9200"]
+      - OPENSEARCH_USERNAME=admin
+      - OPENSEARCH_PASSWORD=${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
+      - OPENSEARCH_SSL_VERIFICATIONMODE=none
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=5601
+    volumes:
+      - opensearch-dashboards-data:/usr/share/opensearch-dashboards/data
+      - ./config/opensearch_dashboards.yml:/usr/share/opensearch-dashboards/config/opensearch_dashboards.yml:ro
+    ports:
+      - "${DASHBOARDS_PORT}:5601"
+    networks:
+      - opensearch-net
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: ${DASHBOARDS_MEM_LIMIT}
+    healthcheck:
+      # /api/status exige autenticacao quando o plugin de seguranca esta ativo.
+      test:
+        - CMD-SHELL
+        - >-
+          curl -sf -u "admin:$${OPENSEARCH_PASSWORD}"
+          http://localhost:5601/api/status
+          | grep -q '"state":"green"'
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+    restart: unless-stopped
+
+  # Servidor que publica os scripts de enroll dos agentes (item 7)
+  #   Linux  : curl -fsSL http://<IP>/install-agent.sh  | sudo sh
+  #   Windows: irm http://<IP>/install-agent.ps1 | iex
+  enroll:
+    image: nginx:1.29-alpine
+    container_name: opensearch-enroll
+    volumes:
+      - ./agent:/usr/share/nginx/html:ro
+    ports:
+      - "${ENROLL_PORT}:80"
+    networks:
+      - opensearch-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost/install-agent.sh >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  opensearch-data:
+    driver: local
+  opensearch-dashboards-data:
+    driver: local
+
+networks:
+  opensearch-net:
+    driver: bridge
