@@ -36,9 +36,14 @@ api -XPUT "${OS_URL}/_cluster/settings" -d '{
     "plugins.ml_commons.jvm_heap_memory_threshold": 100,
     "plugins.ml_commons.disk_free_space_threshold": -1,
     "plugins.anomaly_detection.enabled": true,
-    "plugins.index_state_management.enabled": true
+    "plugins.index_state_management.enabled": true,
+    "plugins.calcite.enabled": false
   }
 }' | head -c 400; echo
+# plugins.calcite.enabled=false: o motor Calcite (novo, padrao no 3.8) nao
+# implementa "SHOW DATASOURCES", que a tela Query Workbench do Dashboards
+# chama ao abrir -> stacktrace "unsupported in Calcite" no log do no a cada
+# visita. O motor legado do plugin SQL atende PPL/SQL desta stack normalmente.
 # NB: os ajustes de logger.* ficam no docker-compose.yml (via -E no startup) -
 # aplicados como cluster settings aqui eles chegariam tarde demais para calar
 # o que a camada de seguranca ja logou no boot.

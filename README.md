@@ -75,11 +75,13 @@ cria o usuário com `{"hash": "$2y$12$..."}`. Ver comentários em
 
 | Arquivo | Função |
 |---|---|
+| `Dockerfile` | Imagem própria do nó: remove Performance Analyzer, adiciona `slf4j-nop`, cria `/certs` |
 | `docker-compose.yml` | Stack: OpenSearch + provisioner + Dashboards + enroll |
 | `.env` | Versão, senhas, heap, limites, portas, LLM (**não vai pro Git**) |
 | `.env.example` | Modelo do `.env` |
 | `config/opensearch_dashboards.yml` | Config do Dashboards (Assistant, Query Assist) |
 | `install.sh` | Instalação em host novo (baixa o repo e sobe a stack) |
+| `scripts/opensearch-entrypoint.sh` | Wrapper do entrypoint: instalador demo, limpeza do `opensearch.yml`, permissões dos certos, publicação do cert admin |
 | `scripts/lib.sh` | Helpers — geração de bcrypt e criação de usuários |
 | `scripts/provision.sh` | Orquestra o provisionamento pós-boot (roda no container) |
 | `scripts/setup-features.sh` | Ativa features dinâmicas via cluster settings |
@@ -227,14 +229,14 @@ curl -k -u pmotiadm:pmotiadm 'https://localhost:9200/_cat/indices/logs-*?v'
 docker compose logs | grep -E "\[WARN |\[ERROR|\[DEPRECATION|WARNING:|SLF4J"
 ```
 
-**Regime permanente: zero linhas** em `opensearch-dashboards`, `provisioner` e
-`enroll`. Depois do boot, `opensearch-node` também não emite mais nada.
+**Zero linhas** em `opensearch-dashboards`, `provisioner` e `enroll` — inclusive
+no boot. No `opensearch-node` sobram 3 linhas de boot (detalhadas abaixo) e
+nada mais depois disso.
 
 ### O que foi corrigido (e como)
 
 | Ruído | Correção |
 |---|---|
-| `PluginSettings`/`StatsCollector`: `performance-analyzer.properties` e `plugin-stats-metadata` não existem | plugin **Performance Analyzer removido** no `scripts/opensearch-entrypoint.sh` (nada na stack usa) |
 | `security_exception ... requestedTenant=__user__` e 403 em `/tenantinfo` | Dashboards passou a usar a conta de serviço **`kibanaserver`**; multitenancy desligada |
 | `opensearch.requestHeadersWhitelist is deprecated` | renomeado para `requestHeadersAllowlist` |
 | `Failed to find config ... os_summary` / `os_summary_with_log_pattern` | `setup-ai.sh` registra os **flow agents de resumo** do Assistant |
@@ -246,23 +248,33 @@ docker compose logs | grep -E "\[WARN |\[ERROR|\[DEPRECATION|WARNING:|SLF4J"
 | `node.max_local_storage_nodes` deprecated | linha removida do `opensearch.yml` gerado |
 | `SQLPlugin: Master key is a required config` | `plugins.query.datasources.encryption.masterkey` definida |
 | `sun.misc.Unsafe`, `Restricted methods`, `System::load` (JVM, 8 linhas) | `--enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow` no `OPENSEARCH_JAVA_OPTS` |
+| `SLF4J: Failed to load class StaticLoggerBinder` / `No SLF4J providers were found` (6 linhas) | `Dockerfile` adiciona `slf4j-nop` aos 7 plugins que embarcam `slf4j-api` sem provider (o efeito já era no-op; agora é explícito e silencioso) |
+| `PluginSettings`/`StatsCollector`: `performance-analyzer.properties` e `plugin-stats-metadata` não existem na imagem | plugin **Performance Analyzer removido no `Dockerfile`** (nada nesta stack usa) |
+| `security_exception: no permissions for []` no Dashboards (telas em branco, Assistant "Error loading conversation: Forbidden") | **removida** a flag `plugins.security.system_indices.permission.enabled` — ela fazia toda listagem com curinga que tocasse índice de sistema responder 403, até para `all_access`. O root agent passa a ser gravado em `.plugins-ml-config` com o **certificado admin (kirk)**, publicado pelo entrypoint em `/certs` |
+| `SystemIndexAccessEvaluator: ... not allowed for a regular user` | todas as escritas em `.plugins-ml-config` passam pelo certificado admin (`ml_config_put`) |
+| `SHOW DATASOURCES is unsupported in Calcite` (stacktrace a cada visita ao Query Workbench) | `plugins.calcite.enabled=false` — o motor legado do plugin SQL atende PPL/SQL desta stack |
+| `MLModelManager: No controller is deployed` | `setup-ai.sh` cria o *model controller* do modelo de embeddings (é o que a própria mensagem pede) |
+| `BackendRegistry: OpenSearch Security not initialized` (~4) | healthcheck só começa a sondar 60 s após a partida (marco gravado pelo entrypoint) — a camada de segurança leva ~40-50 s e qualquer request antes disso gera a linha |
+| `Failed to load API tokens on node start` | `logger.org.opensearch.security.OpenSearchSecurityPlugin=ERROR` (corrida de boot que se resolve sozinha) |
 | `AuditMessageRouter`, salt de compliance, `transport_enabled`, `HookRegistry`, `DanglingIndicesState`, `StreamTransportService`, `SecurityAnalyticsPlugin` | `logger.*=ERROR` no `docker-compose.yml` (via `-E`, no startup) — todos são FYI/corridas de boot que se resolvem sozinhas |
 
-### O que sobra (15 linhas, só no boot)
+### O que sobra (3 linhas, só no boot)
 
-Nenhuma recorre depois que o nó sobe e nenhuma afeta o funcionamento:
+```
+WARNING: Using incubator modules: jdk.incubator.vector
+[WARN][stderr] ... org.apache.lucene.internal.vectorization.PanamaVectorizationProvider <init>
+[WARN][stderr] INFO: Java vector incubator API enabled; uses preferredBitSize=128; floating-point vectors only
+```
 
-| Linha | Qtd | Por que fica |
-|---|---|---|
-| `WARNING: Using incubator modules: jdk.incubator.vector` | 1 | vem de `--add-modules=jdk.incubator.vector` no `jvm.options` da imagem; remover desliga a vetorização SIMD do Lucene |
-| `[WARN][stderr] PanamaVectorizationProvider` / `Java vector incubator API enabled` | 2 | o Lucene imprime o mesmo aviso em stderr |
-| `[WARN][stderr] SLF4J: ...` | 6 | plugins da imagem trazem `slf4j-api` (1.7 **e** 2.x) sem provider no mesmo classloader — empacotamento da imagem |
-| `[ERROR] BackendRegistry: Security not initialized` | ~4 | sondas que chegam nos ~15 s em que o índice de segurança ainda sobe; normal em qualquer OpenSearch |
-| `[WARN] Failed to load API tokens on node start` | 1 | corrida de boot (`state not recovered`); resolve sozinha |
-| `[ERROR] MLModelManager: No controller is deployed` | 1 | o ML Commons loga em ERROR um estado **esperado** (modelo sem rate-limiter) |
+São o launcher do JDK 25 e o Lucene **anunciando** que o módulo
+`jdk.incubator.vector` está ativo — é o SIMD/Panama que acelera k-NN e neural
+search, ligado de propósito pelo `config/jvm.options` da imagem oficial.
 
-As 9 primeiras só sairiam reconstruindo a imagem (`Dockerfile` próprio com
-`jvm.options` editado e `slf4j-nop` nos plugins). As 6 últimas são transitórias.
+Tirar o módulo **piora**: some 1 linha e aparecem 2 outras
+(`Java vector incubator module is not readable. For optimal vector
+performance, pass '--add-modules jdk.incubator.vector'`), além de perder a
+vetorização. Não há flag do JDK que silencie o aviso de módulo incubator.
+Por isso o `Dockerfile` deliberadamente **não** mexe nessa linha.
 
 ## 8. Troubleshooting
 

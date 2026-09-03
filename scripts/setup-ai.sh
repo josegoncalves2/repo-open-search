@@ -248,6 +248,18 @@ else
   echo "    embeddings ja existe: ${EMB_MODEL_ID}"
 fi
 
+# Model controller: sem ele, todo deploy do modelo local faz o ML Commons logar
+#   [ERROR][MLModelManager] No controller is deployed because the model <id> is
+#   expected not having an enabled model controller. Please use the create
+#   controller api to create one if this is unexpected.
+# ...que e exatamente o que fazemos aqui. Sem rate limit (objeto vazio).
+if [ -n "${EMB_MODEL_ID:-}" ] && [ "${EMB_MODEL_ID}" != null ]; then
+  if ! api -o /dev/null -w '%{http_code}' "${OS_URL}/_plugins/_ml/controllers/${EMB_MODEL_ID}" | grep -q 200; then
+    api -XPOST "${OS_URL}/_plugins/_ml/controllers/${EMB_MODEL_ID}" \
+      -d '{"user_rate_limiter":{}}' | jq -c '{status}' 2>/dev/null || true
+  fi
+fi
+
 # --------------------------------------------------------------------------
 echo "==> 4. Root agent '${AGENT_NAME}'"
 
@@ -319,22 +331,39 @@ fi
 
 # --------------------------------------------------------------------------
 echo "==> 5. Registrando '${AGENT_ID}' como root agent do Assistant (os_chat)"
-# Os indices .plugins-ml-* sao system indices protegidos: nem all_access os
-# acessa. Requer o node setting plugins.security.system_indices.permission.enabled
-# =true (ja no docker-compose.yml) + uma role com 'system:admin/system_index'.
-# ATENCAO: o escopo tem de ser .plugins-ml-* (nao so .plugins-ml-config), senao
-# com a permission feature ligada o proprio _plugins/_ml/models/_search da 403.
-api -XPUT "${OS_URL}/_plugins/_security/api/roles/ml-config-writer" -d '{
-  "cluster_permissions": [],
-  "index_permissions": [{
-    "index_patterns": [".plugins-ml-*"],
-    "allowed_actions": ["system:admin/system_index"]
-  }]
-}' | jq -c '{status}' 2>/dev/null || true
-api -XPUT "${OS_URL}/_plugins/_security/api/rolesmapping/ml-config-writer" \
-  -d "{\"users\":[\"${OS_ADMIN_USER}\"]}" | jq -c '{status}' 2>/dev/null || true
-sleep 2
-CFG=$(api -XPUT "${OS_URL}/.plugins-ml-config/_doc/os_chat" -d "{
+# .plugins-ml-config e um system index: nenhum usuario REST escreve nele, nem
+# all_access. A alternativa "obvia" -
+#   plugins.security.system_indices.permission.enabled=true + role com
+#   system:admin/system_index
+# - NAO deve ser usada: com essa flag ligada, toda operacao com curinga que
+# resolva indices de sistema (GET /_list/indices, usado por varias telas do
+# Dashboards) passa a responder 403 "no permissions for []" e as paginas
+# renderizam vazias.
+# O caminho suportado e o CERTIFICADO ADMIN (kirk), que bypassa a camada de
+# seguranca. O entrypoint do no publica os certos em ${OS_CERT_DIR:-/certs}.
+CERT_DIR="${OS_CERT_DIR:-/certs}"
+
+# ml_config_put <doc_id> <json> : grava em .plugins-ml-config.
+# Usa o certificado admin quando disponivel; o fallback REST funciona mas deixa
+# 1x WARN "SystemIndexAccessEvaluator: ... not allowed for a regular user"
+# por gravacao no log do no.
+ml_config_put() {
+  local doc="$1" body="$2"
+  if [ -r "${CERT_DIR}/kirk.pem" ] && [ -r "${CERT_DIR}/kirk-key.pem" ]; then
+    curl -sk --cert "${CERT_DIR}/kirk.pem" --key "${CERT_DIR}/kirk-key.pem" \
+         --cacert "${CERT_DIR}/root-ca.pem" -H 'Content-Type: application/json' \
+         -XPUT "${OS_URL}/.plugins-ml-config/_doc/${doc}" -d "$body"
+  else
+    api -XPUT "${OS_URL}/.plugins-ml-config/_doc/${doc}" -d "$body"
+  fi
+}
+
+if [ -r "${CERT_DIR}/kirk.pem" ]; then
+  echo "    usando certificado admin (${CERT_DIR}/kirk.pem)"
+else
+  echo "    aviso: certificado admin nao encontrado em ${CERT_DIR}; usando REST"
+fi
+CFG=$(ml_config_put os_chat "{
   \"type\": \"os_chat_root_agent\",
   \"configuration\": { \"agent_id\": \"${AGENT_ID}\" }
 }")
@@ -377,7 +406,7 @@ for cfg in os_summary os_summary_with_log_pattern; do
   fi
   said=$(register_flow_summary "OpenSearch Assistant Summary Agent (${cfg})")
   if [ -n "$said" ] && [ "$said" != null ]; then
-    r=$(api -XPUT "${OS_URL}/.plugins-ml-config/_doc/${cfg}" -d "{
+    r=$(ml_config_put "${cfg}" "{
       \"type\": \"${cfg}\",
       \"configuration\": { \"agent_id\": \"${said}\" }
     }" | jq -r '.result // .status // "?"')

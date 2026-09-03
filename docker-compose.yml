@@ -1,6 +1,14 @@
 services:
   opensearch:
-    image: opensearchproject/opensearch:${OPENSEARCH_VERSION}
+    # Imagem propria (Dockerfile): parte do ruido de boot so sai reconstruindo -
+    # Performance Analyzer sem arquivos de config, jdk.incubator.vector e
+    # plugins com slf4j-api sem provider. Ver README "Logs limpos".
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        OPENSEARCH_VERSION: ${OPENSEARCH_VERSION}
+    image: openstack/opensearch:${OPENSEARCH_VERSION}
     container_name: opensearch-node
     # wrapper: remove Performance Analyzer, roda o instalador demo, limpa linhas
     # ruidosas do opensearch.yml e aperta permissoes antes do entrypoint oficial.
@@ -48,6 +56,10 @@ services:
       # corrida de boot que se resolve sozinha (os indices .opensearch-sap-* ficam
       # green segundos depois). A classe so loga ciclo de vida do plugin.
       - logger.org.opensearch.securityanalytics.SecurityAnalyticsPlugin=ERROR
+      # OpenSearchSecurityPlugin: "Failed to load API tokens on node start" e uma
+      # corrida do boot (a leitura acontece antes de 'state recovered') que se
+      # resolve sozinha. Em ERROR, falha real da mesma classe continua aparecendo.
+      - logger.org.opensearch.security.OpenSearchSecurityPlugin=ERROR
       # ---- features de IA / Agentic / LLM como node settings (via env) --------
       - plugins.ml_commons.agent_framework_enabled=true
       - plugins.ml_commons.rag_pipeline_feature_enabled=true
@@ -56,10 +68,14 @@ services:
       - plugins.ml_commons.allow_registering_model_via_url=true
       - plugins.ml_commons.native_memory_threshold=100
       - plugins.ml_commons.jvm_heap_memory_threshold=100
-      # Permite que roles recebam 'system:admin/system_index'. Necessario para
-      # gravar o root agent do Assistant em .plugins-ml-config (setup-ai.sh).
-      # Sem isso, nem o all_access escreve nesse indice (403 security_exception).
-      - plugins.security.system_indices.permission.enabled=true
+      # NAO ligar 'plugins.security.system_indices.permission.enabled'.
+      # Ela parecia necessaria para gravar o root agent em .plugins-ml-config,
+      # mas quebra o Dashboards: com ela ligada qualquer operacao com curinga
+      # que resolva indices de sistema (ex.: GET /_list/indices, usado pelas
+      # telas de Index Management / Anomaly Detection / ML Commons) responde
+      # 403 "no permissions for [] and User [...]" mesmo para all_access, e a
+      # pagina renderiza vazia. O provisioner grava em .plugins-ml-config com o
+      # certificado admin (kirk), que dispensa a flag.
       # NOTA: nao adiantam 'password_validation_regex' nem
       # 'password_score_based_validation_strength' para permitir senha fraca -
       # o piso do score e 'fair'. A senha final e aplicada como HASH bcrypt
@@ -70,6 +86,9 @@ services:
     volumes:
       - opensearch-data:/usr/share/opensearch/data
       - ./scripts/opensearch-entrypoint.sh:/opensearch-entrypoint.sh:ro
+      # o entrypoint copia os certos demo (kirk) para ca; o provisioner usa o
+      # certificado admin para gravar em .plugins-ml-config (indice de sistema)
+      - opensearch-certs:/certs
     ports:
       - "${OPENSEARCH_PORT}:9200"
       - "${OPENSEARCH_PERF_PORT}:9600"
@@ -78,19 +97,23 @@ services:
       resources:
         limits: { memory: "${OPENSEARCH_MEM_LIMIT}" }
     healthcheck:
-      # autentica com a conta reservada 'admin' (probe sem credencial deixa
-      # "BackendRegistry: No 'Authorization' header" no log). Nos primeiros ~15s
-      # de um boot frio o servidor ainda loga alguns "Security not initialized"
-      # ate a camada de seguranca subir - isso e normal em qualquer OpenSearch.
+      # 1) nao sonda antes de 60s: a camada de seguranca leva ~40-50s para
+      #    inicializar e QUALQUER request nesse intervalo faz o no logar
+      #    "BackendRegistry: OpenSearch Security not initialized";
+      # 2) autentica com a conta reservada 'admin' - sonda anonima deixaria
+      #    "No 'Authorization' header" no log.
+      # O marco de partida e gravado pelo scripts/opensearch-entrypoint.sh.
       test:
         - CMD-SHELL
         - >-
+          t0=$$(cat /tmp/.opensearch-start-epoch 2>/dev/null || echo 0);
+          [ $$(( $$(date +%s) - $$t0 )) -ge 60 ] || exit 1;
           curl -sk -u "admin:$${OPENSEARCH_INITIAL_ADMIN_PASSWORD}"
           -o /dev/null -w '%{http_code}' https://localhost:9200 | grep -q 200
-      interval: 15s
+      interval: 10s
       timeout: 10s
-      retries: 40
-      start_period: 90s
+      retries: 60
+      start_period: 150s
     restart: unless-stopped
 
   # -----------------------------------------------------------------------
@@ -119,8 +142,10 @@ services:
       - LLM_API_KEY=${LLM_API_KEY}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL}
       - EMBEDDING_VERSION=${EMBEDDING_VERSION}
+      - OS_CERT_DIR=/certs
     volumes:
       - ./scripts:/scripts:ro
+      - opensearch-certs:/certs:ro
     command: >-
       sh -c "apk add --no-cache bash curl jq apache2-utils >/dev/null && bash /scripts/provision.sh"
     networks: [opensearch-net]
@@ -184,6 +209,7 @@ services:
 volumes:
   opensearch-data:            { driver: local }
   opensearch-dashboards-data: { driver: local }
+  opensearch-certs:           { driver: local }
 
 networks:
   opensearch-net: { driver: bridge }
