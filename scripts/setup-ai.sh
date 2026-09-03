@@ -192,73 +192,16 @@ else
 fi
 
 # --------------------------------------------------------------------------
-echo "==> 3. Modelo local de embeddings (${EMBEDDING_MODEL} v${EMBEDDING_VERSION})"
-EMB_MODEL_ID=$(api "${OS_URL}/_plugins/_ml/models/_search" \
-  -d "{\"size\":1,\"query\":{\"bool\":{\"must\":[
-        {\"match_phrase\":{\"name\":\"${EMBEDDING_MODEL}\"}},
-        {\"terms\":{\"model_state\":[\"DEPLOYED\",\"REGISTERED\",\"PARTIALLY_DEPLOYED\"]}}]}}}" \
-  | jq -r '.hits.hits[0]._id // empty')
-
-# O 1o registro em volume novo baixa o modelo + o runtime nativo do PyTorch/DJL
-# (centenas de MB) e descompacta. Pode levar 10-30min em host modesto. Por isso:
-# espera longa, com estado visivel, e 1 nova tentativa se a task falhar (o que
-# ja baixou fica em cache, entao a 2a passa e bem mais rapida).
-register_embeddings() {   # imprime o task_id
-  api -XPOST "${OS_URL}/_plugins/_ml/models/_register?deploy=true" -d "{
-    \"name\": \"${EMBEDDING_MODEL}\",
-    \"version\": \"${EMBEDDING_VERSION}\",
-    \"model_format\": \"TORCH_SCRIPT\"
-  }" | jq -r '.task_id // empty'
-}
-
-wait_task() {   # $1 = task_id ; imprime "<state>|<model_id>" ; 0 se COMPLETED
-  local tid="$1" line st mid
-  for _ in $(seq 1 240); do    # 240 x 15s = 60min
-    line=$(api "${OS_URL}/_plugins/_ml/tasks/${tid}" \
-             | jq -r '"\(.state // "??")|\(.model_id // "")"')
-    st=${line%%|*}; mid=${line#*|}
-    case "$st" in
-      COMPLETED)                    echo "${st}|${mid}"; return 0 ;;
-      FAILED|COMPLETED_WITH_ERROR)  echo "${st}|${mid}"; return 1 ;;
-    esac
-    sleep 15
-  done
-  echo "TIMEOUT|${mid}"; return 1
-}
-
-if [ -z "$EMB_MODEL_ID" ]; then
-  for attempt in 1 2; do
-    TASK_ID=$(register_embeddings)
-    if [ -z "$TASK_ID" ]; then
-      echo "    aviso: registro do modelo de embeddings nao retornou task_id"
-      break
-    fi
-    echo "    tentativa ${attempt}: task ${TASK_ID} (baixa modelo + runtime PyTorch; pode demorar)"
-    RES=$(wait_task "$TASK_ID") && RC=0 || RC=1
-    ST=${RES%%|*}; MID=${RES#*|}
-    if [ "$RC" = 0 ] && [ -n "$MID" ]; then
-      EMB_MODEL_ID="$MID"
-      echo "    embeddings: ${EMB_MODEL_ID} -> $(wait_model "$EMB_MODEL_ID" || true)"
-      break
-    fi
-    echo "    tentativa ${attempt} terminou em '${ST}'"
-  done
-  [ -n "${EMB_MODEL_ID:-}" ] || echo "    AVISO: embeddings nao registraram - o agent fica SEM VectorDBTool. Reexecute com 'docker compose up -d --force-recreate provisioner' (o que ja baixou fica em cache)."
-else
-  echo "    embeddings ja existe: ${EMB_MODEL_ID}"
-fi
-
-# Model controller: sem ele, todo deploy do modelo local faz o ML Commons logar
-#   [ERROR][MLModelManager] No controller is deployed because the model <id> is
-#   expected not having an enabled model controller. Please use the create
-#   controller api to create one if this is unexpected.
-# ...que e exatamente o que fazemos aqui. Sem rate limit (objeto vazio).
-if [ -n "${EMB_MODEL_ID:-}" ] && [ "${EMB_MODEL_ID}" != null ]; then
-  if ! api -o /dev/null -w '%{http_code}' "${OS_URL}/_plugins/_ml/controllers/${EMB_MODEL_ID}" | grep -q 200; then
-    api -XPOST "${OS_URL}/_plugins/_ml/controllers/${EMB_MODEL_ID}" \
-      -d '{"user_rate_limiter":{}}' | jq -c '{status}' 2>/dev/null || true
-  fi
-fi
+# Embeddings locais: DESATIVADO neste ambiente. Provisionamos SOMENTE o chat
+# remoto via OpenRouter (MiniMax, configurado e testado). Baixar o modelo de
+# embeddings + runtime PyTorch (centenas de MB) tornava o cold start do
+# provisioner lento (10-30min) e o agent nao ganha nada com isso: o chat
+# conversacional funciona sem VectorDBTool; o RAG (que exigiria embeddings
+# locais) nao e usado nesta instalacao. Mantemos EMB_MODEL_ID vazio e o
+# VectorDBTool e simplesmente omitido do agent, mais abaixo.
+echo "==> 3. Embedding local: PULADO (chat remoto OpenRouter/MiniMax ja cobre)"
+EMB_MODEL_ID=""
+SKIP_EMBEDDINGS=1
 
 # --------------------------------------------------------------------------
 echo "==> 4. Root agent '${AGENT_NAME}'"
@@ -319,6 +262,23 @@ register_agent() {
   }" | jq -r '.agent_id'
 }
 
+# prune_agents <nome> <id_para_manter> : apaga os agentes homonimos orfaos.
+# O _register SEMPRE cria um agente novo (nao existe "upsert" por nome), entao
+# sem isto cada execucao do provisioner deixa mais um "OpenSearch Assistant
+# Root Agent" para tras e o seletor de agentes do Dashboards enche de
+# duplicatas apontando para modelos velhos.
+prune_agents() {
+  local name="$1" keep="$2" old n=0
+  for old in $(api "${OS_URL}/_plugins/_ml/agents/_search" \
+        -d "{\"size\":100,\"_source\":false,\"query\":{\"term\":{\"name.keyword\":\"${name}\"}}}" \
+        | jq -r '.hits.hits[]._id // empty'); do
+    [ "$old" = "$keep" ] && continue
+    api -XDELETE "${OS_URL}/_plugins/_ml/agents/${old}" >/dev/null 2>&1 && n=$((n+1))
+  done
+  [ "$n" -gt 0 ] && echo "    removidos ${n} agente(s) orfao(s) de '${name}'"
+  return 0
+}
+
 if [ -z "$AGENT_ID" ]; then
   AGENT_ID=$(register_agent)
   echo "    agent criado: ${AGENT_ID}"
@@ -328,6 +288,7 @@ else
   echo "    novo agent: ${AGENT_ID}"
 fi
 [ -n "$AGENT_ID" ] && [ "$AGENT_ID" != null ] || { echo "FALHA: sem agent_id"; exit 1; }
+prune_agents "${AGENT_NAME}" "${AGENT_ID}"
 
 # --------------------------------------------------------------------------
 echo "==> 5. Registrando '${AGENT_ID}' como root agent do Assistant (os_chat)"
@@ -410,6 +371,7 @@ for cfg in os_summary os_summary_with_log_pattern; do
       \"type\": \"${cfg}\",
       \"configuration\": { \"agent_id\": \"${said}\" }
     }" | jq -r '.result // .status // "?"')
+    prune_agents "OpenSearch Assistant Summary Agent (${cfg})" "${said}"
     echo "    ${cfg} -> agent ${said} (${r})"
   else
     echo "    aviso: nao consegui registrar o agent para ${cfg}"
@@ -443,6 +405,52 @@ if ! api -o /dev/null -w '%{http_code}' "${OS_URL}/sample-logs" | grep -q 200; t
   echo "    sample-logs criado (3 docs)"
 else
   echo "    sample-logs ja existe"
+fi
+
+# --------------------------------------------------------------------------
+# Indices de configuracao do Anomaly Detection e do Forecasting so nascem
+# quando o primeiro detector/forecaster e criado. Ate la, abrir essas telas no
+# Dashboards faz o no logar:
+#   [ERROR][RestHandlerUtils] Wrap exception before sending back to user
+#   IndexNotFoundException[no such index [.opendistro-anomaly-detectors]]
+#   IndexNotFoundException[no such index [.opensearch-forecasters]]
+# Criamos um objeto temporario pela API DO PROPRIO PLUGIN (assim o mapping sai
+# correto - criar o indice na mao quebraria o plugin depois) e o apagamos em
+# seguida: fica o indice vazio, e a tela passa a listar "nenhum" em vez de erro.
+echo "==> 5d. Bootstrap dos indices de Anomaly Detection / Forecasting"
+FEATURE_ATTR='"feature_attributes":[{"feature_name":"c","feature_enabled":true,"aggregation_query":{"c":{"value_count":{"field":"level"}}}}]'
+
+if ! api -o /dev/null -w '%{http_code}' "${OS_URL}/.opendistro-anomaly-detectors" | grep -q 200; then
+  did=$(api -XPOST "${OS_URL}/_plugins/_anomaly_detection/detectors" -d "{
+    \"name\":\"_bootstrap_tmp\",\"description\":\"temporario - cria o indice de config\",
+    \"time_field\":\"@timestamp\",\"indices\":[\"sample-logs\"], ${FEATURE_ATTR},
+    \"detection_interval\":{\"period\":{\"interval\":10,\"unit\":\"Minutes\"}},
+    \"window_delay\":{\"period\":{\"interval\":1,\"unit\":\"Minutes\"}}}" | jq -r '._id // empty')
+  if [ -n "$did" ]; then
+    api -XDELETE "${OS_URL}/_plugins/_anomaly_detection/detectors/${did}" >/dev/null 2>&1 || true
+    echo "    .opendistro-anomaly-detectors criado"
+  else
+    echo "    aviso: nao consegui criar o indice de anomaly detection"
+  fi
+else
+  echo "    .opendistro-anomaly-detectors ja existe"
+fi
+
+if ! api -o /dev/null -w '%{http_code}' "${OS_URL}/.opensearch-forecasters" | grep -q 200; then
+  fid=$(api -XPOST "${OS_URL}/_plugins/_forecast/forecasters" -d "{
+    \"name\":\"_bootstrap_tmp\",\"description\":\"temporario - cria o indice de config\",
+    \"time_field\":\"@timestamp\",\"indices\":[\"sample-logs\"], ${FEATURE_ATTR},
+    \"forecast_interval\":{\"period\":{\"interval\":10,\"unit\":\"Minutes\"}},
+    \"window_delay\":{\"period\":{\"interval\":1,\"unit\":\"Minutes\"}},
+    \"horizon\":3,\"shingle_size\":8}" | jq -r '._id // empty')
+  if [ -n "$fid" ]; then
+    api -XDELETE "${OS_URL}/_plugins/_forecast/forecasters/${fid}" >/dev/null 2>&1 || true
+    echo "    .opensearch-forecasters criado"
+  else
+    echo "    aviso: nao consegui criar o indice de forecasting"
+  fi
+else
+  echo "    .opensearch-forecasters ja existe"
 fi
 
 # --------------------------------------------------------------------------
