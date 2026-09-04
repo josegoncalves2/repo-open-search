@@ -72,13 +72,21 @@ install_pkg() {
   case "$PKG" in
     apt)
       log "Configurando repositorio APT oficial do Fluent Bit"
+      # Remove restos de uma tentativa anterior ANTES do primeiro update: uma
+      # sources.list.d/fluent-bit.list invalida faz o apt-get update inteiro
+      # falhar ("does not have a Release file") e, com set -e, aborta o script
+      # antes mesmo de reescrever o arquivo.
+      rm -f /etc/apt/sources.list.d/fluent-bit.list
       DEBIAN_FRONTEND=noninteractive apt-get update -qq
       DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl gnupg ca-certificates >/dev/null
       install -d -m 0755 /usr/share/keyrings
       curl -fsSL https://packages.fluentbit.io/fluentbit.key \
-        | gpg --dearmor -o /usr/share/keyrings/fluentbit-keyring.gpg
+        | gpg --batch --yes --no-tty --dearmor -o /usr/share/keyrings/fluentbit-keyring.gpg
       CODENAME="${VERSION_CODENAME:-$(lsb_release -cs 2>/dev/null || echo jammy)}"
-      echo "deb [signed-by=/usr/share/keyrings/fluentbit-keyring.gpg] https://packages.fluentbit.io/${ID} ${CODENAME} main" \
+      # O repo do Fluent Bit publica em /<distro>/<codename>/dists/<codename>/ -
+      # o codename entra DUAS vezes. Sem o codename no caminho o apt-get update
+      # falha com "does not have a Release file".
+      echo "deb [signed-by=/usr/share/keyrings/fluentbit-keyring.gpg] https://packages.fluentbit.io/${ID}/${CODENAME} ${CODENAME} main" \
         > /etc/apt/sources.list.d/fluent-bit.list
       DEBIAN_FRONTEND=noninteractive apt-get update -qq
       DEBIAN_FRONTEND=noninteractive apt-get install -y -qq fluent-bit >/dev/null
