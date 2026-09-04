@@ -80,7 +80,7 @@ if [ -s "$HOSTS_FILE" ]; then
     else printf 'senha SSH: ' >&2; stty -echo 2>/dev/null
          read -r FLEET_SSHPASS < /dev/tty; stty echo 2>/dev/null; echo >&2; fi
   fi
-  FLAG=""; [ "$DO_UNINSTALL" = 1 ] && FLAG=" -s -- --uninstall"
+  FLAG=""; if [ "$DO_UNINSTALL" = 1 ]; then FLAG=" -s -- --uninstall"; fi
   OUT=$(mktemp -d); trap 'rm -rf "$OUT" "$HOSTS_FILE"' EXIT
 
   log "Servidor de enroll : http://${FLEET_SERVER}/install-agent.sh"
@@ -97,8 +97,8 @@ if [ -s "$HOSTS_FILE" ]; then
       case "$hp" in *@*) user=${hp%%@*}; host=${hp#*@} ;; *) host="$hp" ;; esac
       set -- ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
                  -o ConnectTimeout=10 -o LogLevel=ERROR
-      [ -n "$port" ] && set -- "$@" -p "$port"
-      [ -n "$FLEET_SSHPASS" ] && set -- sshpass -e "$@"
+      if [ -n "$port" ]; then set -- "$@" -p "$port"; fi
+      if [ -n "$FLEET_SSHPASS" ]; then set -- sshpass -e "$@"; fi
       REMOTE="set -e
 curl -fsSL http://${FLEET_SERVER}/install-agent.sh -o /tmp/install-agent.sh
 if [ -n '${FLEET_SUDOPASS}' ]; then
@@ -113,12 +113,14 @@ rm -f /tmp/install-agent.sh"
       else echo "FALHA|${spec}" >> "${OUT}/result"; fi
     ) &
     i=$((i+1))
-    [ $((i % FLEET_JOBS)) -eq 0 ] && wait
+    if [ $((i % FLEET_JOBS)) -eq 0 ]; then wait; fi
   done < "$HOSTS_FILE"
   wait
 
-  OKN=$(grep -c '^OK|'    "${OUT}/result" 2>/dev/null); OKN=${OKN:-0}
-  BADN=$(grep -c '^FALHA|' "${OUT}/result" 2>/dev/null); BADN=${BADN:-0}
+  # '|| true': grep -c sai 1 quando nao casa nada e, sob set -e, uma atribuicao
+  # por substituicao que falha aborta o script - o resumo nunca era impresso.
+  OKN=$(grep -c '^OK|'    "${OUT}/result" 2>/dev/null || true); OKN=${OKN:-0}
+  BADN=$(grep -c '^FALHA|' "${OUT}/result" 2>/dev/null || true); BADN=${BADN:-0}
   echo "==========================================================="
   printf ' Resultado: %s ok, %s falha(s), de %s host(s)\n' "$OKN" "$BADN" "$N"
   echo "==========================================================="
@@ -129,8 +131,7 @@ rm -f /tmp/install-agent.sh"
       tail -4 "${OUT}/$(echo "$h" | tr -c 'a-zA-Z0-9' '_').log" 2>/dev/null | sed 's/^/    /'
     done
   fi
-  [ "$BADN" -eq 0 ]
-  exit $?
+  if [ "$BADN" -eq 0 ]; then exit 0; else exit 1; fi
 fi
 set -- $ARGS_LEFT
 
