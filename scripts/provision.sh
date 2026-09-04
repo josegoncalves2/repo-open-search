@@ -98,6 +98,10 @@ export OS_URL OS_ADMIN_USER="$CU" OS_ADMIN_PASS="$CP"
 log "Ativando features (setup-features.sh)"
 bash "$(dirname "$0")/setup-features.sh" || warn "setup-features.sh falhou (seguindo)"
 
+# --------------------------- 4b. template + retencao dos logs ----------
+log "Template e politica de retencao dos indices de log (setup-logs.sh)"
+bash "$(dirname "$0")/setup-logs.sh" || warn "setup-logs.sh falhou (seguindo)"
+
 # --------------------------- 5. usuario de ingestao ------------------------
 if [ -n "${AGENT_USER:-}" ] && [ -n "${AGENT_PASS:-}" ]; then
   log "Criando usuario de ingestao '${AGENT_USER}' (setup-agent-user.sh)"

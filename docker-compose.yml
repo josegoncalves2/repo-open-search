@@ -190,6 +190,28 @@ services:
       start_period: 90s
     restart: unless-stopped
 
+  # -----------------------------------------------------------------------
+  # Cria os saved objects do Dashboards (index patterns). Precisa ser um
+  # servico separado do 'provisioner': aquele roda ANTES do Dashboards existir.
+  # Sem isto os logs dos agentes chegam ao OpenSearch mas o Discover fica
+  # vazio, porque nao ha index pattern para 'logs-*'.
+  # -----------------------------------------------------------------------
+  dashboards-init:
+    image: alpine:3.24
+    container_name: opensearch-dashboards-init
+    depends_on:
+      opensearch-dashboards: { condition: service_healthy }
+    environment:
+      - OSD_URL=http://opensearch-dashboards:5601
+      - OSD_USER=${OPENSEARCH_ADMIN_USER}
+      - OSD_PASS=${OPENSEARCH_ADMIN_PASSWORD}
+    volumes:
+      - ./scripts:/scripts:ro
+    command: >-
+      sh -c "apk add --no-cache bash curl jq >/dev/null && bash /scripts/setup-dashboards.sh"
+    networks: [opensearch-net]
+    restart: "no"
+
   enroll:
     image: nginx:1.31-alpine
     container_name: opensearch-enroll
