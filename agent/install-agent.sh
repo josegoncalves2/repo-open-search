@@ -2,11 +2,19 @@
 # ===========================================================================
 #  Enroll de agente de logs -> OpenSearch  (Linux)
 #
-#  Instalar:
+#  UM host (o proprio):
 #    curl -fsSL http://192.168.1.73/install-agent.sh | sudo sh
-#
-#  Desinstalar:
 #    curl -fsSL http://192.168.1.73/install-agent.sh | sudo sh -s -- --uninstall
+#
+#  VARIOS hosts (o mesmo script se distribui por SSH):
+#    ./install-agent.sh --hosts hosts.txt
+#    ./install-agent.sh --hosts hosts.txt --uninstall
+#    ./install-agent.sh web1 web2 db1
+#
+#    hosts.txt: um por linha, [usuario@]host[:porta]; '#' comenta.
+#    Chave SSH por padrao; --ask-pass usa senha (requer sshpass) e
+#    --sudo-pass para sudo com senha. Em automacao, exporte SSH_PASSWORD
+#    e SUDO_PASSWORD. Paralelismo com -j (padrao 10).
 #
 #  Agente: Fluent Bit (pacote oficial fluent/fluent-bit)
 #  Destino: indice logs-<hostname> no OpenSearch
@@ -30,6 +38,105 @@ log()  { printf '\033[1;32m[+]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
+# ===========================================================================
+# MODO FROTA: se vierem hosts, este mesmo script se distribui por SSH e cada
+# alvo o executa em modo local. Nao precisa de root aqui - so nos alvos.
+# ===========================================================================
+HOSTS_FILE=$(mktemp); trap 'rm -f "$HOSTS_FILE"' EXIT
+FLEET_JOBS="${JOBS:-10}"
+FLEET_SERVER="${ENROLL_SERVER:-$OS_HOST}"
+FLEET_USER="${SSH_USER:-${USER:-root}}"
+FLEET_ASKPASS=0; FLEET_SSHPASS=""; FLEET_SUDOPASS=""
+DO_UNINSTALL=0
+ARGS_LEFT=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --hosts)     [ -r "${2:-}" ] || die "arquivo de hosts ilegivel: ${2:-}"
+                 sed 's/#.*//' "$2" | tr -d '[:blank:]' | grep -v '^$' >> "$HOSTS_FILE"
+                 shift 2 ;;
+    --server)    FLEET_SERVER="$2"; shift 2 ;;
+    -u|--user)   FLEET_USER="$2";   shift 2 ;;
+    -j|--jobs)   FLEET_JOBS="$2";   shift 2 ;;
+    --ask-pass)  FLEET_ASKPASS=1;   shift ;;
+    --sudo-pass) if [ -n "${SUDO_PASSWORD:-}" ]; then FLEET_SUDOPASS="$SUDO_PASSWORD"
+                 else printf 'senha do sudo remoto: ' >&2; stty -echo 2>/dev/null
+                      read -r FLEET_SUDOPASS < /dev/tty; stty echo 2>/dev/null; echo >&2; fi
+                 shift ;;
+    --uninstall) DO_UNINSTALL=1; ARGS_LEFT="--uninstall"; shift ;;
+    -h|--help)   sed -n '2,26p' "$0"; exit 0 ;;
+    -*)          die "opcao desconhecida: $1" ;;
+    *)           echo "$1" >> "$HOSTS_FILE"; shift ;;
+  esac
+done
+
+if [ -s "$HOSTS_FILE" ]; then
+  N=$(wc -l < "$HOSTS_FILE" | tr -d ' ')
+  curl -fsS -o /dev/null --max-time 5 "http://${FLEET_SERVER}/install-agent.sh" \
+    || die "http://${FLEET_SERVER}/install-agent.sh nao responde - o container 'enroll' esta no ar?"
+  if [ "$FLEET_ASKPASS" = 1 ]; then
+    command -v sshpass >/dev/null || die "--ask-pass exige sshpass (apt install sshpass)"
+    if [ -n "${SSH_PASSWORD:-}" ]; then FLEET_SSHPASS="$SSH_PASSWORD"
+    else printf 'senha SSH: ' >&2; stty -echo 2>/dev/null
+         read -r FLEET_SSHPASS < /dev/tty; stty echo 2>/dev/null; echo >&2; fi
+  fi
+  FLAG=""; [ "$DO_UNINSTALL" = 1 ] && FLAG=" -s -- --uninstall"
+  OUT=$(mktemp -d); trap 'rm -rf "$OUT" "$HOSTS_FILE"' EXIT
+
+  log "Servidor de enroll : http://${FLEET_SERVER}/install-agent.sh"
+  log "Acao               : $([ "$DO_UNINSTALL" = 1 ] && echo desinstalar || echo instalar)"
+  log "Hosts              : ${N}  (paralelismo ${FLEET_JOBS})"
+  echo
+
+  i=0
+  while IFS= read -r spec; do
+    [ -n "$spec" ] || continue
+    (
+      hp=${spec%%:*}; port=""; user="$FLEET_USER"
+      case "$spec" in *:*) port=${spec##*:} ;; esac
+      case "$hp" in *@*) user=${hp%%@*}; host=${hp#*@} ;; *) host="$hp" ;; esac
+      set -- ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                 -o ConnectTimeout=10 -o LogLevel=ERROR
+      [ -n "$port" ] && set -- "$@" -p "$port"
+      [ -n "$FLEET_SSHPASS" ] && set -- sshpass -e "$@"
+      REMOTE="set -e
+curl -fsSL http://${FLEET_SERVER}/install-agent.sh -o /tmp/install-agent.sh
+if [ -n '${FLEET_SUDOPASS}' ]; then
+  echo '${FLEET_SUDOPASS}' | sudo -S -p '' sh /tmp/install-agent.sh${FLAG}
+else
+  sudo -n sh /tmp/install-agent.sh${FLAG}
+fi
+rm -f /tmp/install-agent.sh"
+      safe=$(echo "$spec" | tr -c 'a-zA-Z0-9' '_')
+      if SSHPASS="$FLEET_SSHPASS" "$@" "${user}@${host}" "$REMOTE" > "${OUT}/${safe}.log" 2>&1
+      then echo "OK|${spec}" >> "${OUT}/result"
+      else echo "FALHA|${spec}" >> "${OUT}/result"; fi
+    ) &
+    i=$((i+1))
+    [ $((i % FLEET_JOBS)) -eq 0 ] && wait
+  done < "$HOSTS_FILE"
+  wait
+
+  OKN=$(grep -c '^OK|'    "${OUT}/result" 2>/dev/null); OKN=${OKN:-0}
+  BADN=$(grep -c '^FALHA|' "${OUT}/result" 2>/dev/null); BADN=${BADN:-0}
+  echo "==========================================================="
+  printf ' Resultado: %s ok, %s falha(s), de %s host(s)\n' "$OKN" "$BADN" "$N"
+  echo "==========================================================="
+  if [ "$BADN" -gt 0 ]; then
+    echo; echo "Falhas (ultimas linhas de cada):"
+    grep '^FALHA|' "${OUT}/result" | cut -d'|' -f2 | while read -r h; do
+      echo "--- $h"
+      tail -4 "${OUT}/$(echo "$h" | tr -c 'a-zA-Z0-9' '_').log" 2>/dev/null | sed 's/^/    /'
+    done
+  fi
+  [ "$BADN" -eq 0 ]
+  exit $?
+fi
+set -- $ARGS_LEFT
+
+# ===========================================================================
+# MODO LOCAL: instala neste host.
+# ===========================================================================
 [ "$(id -u)" -eq 0 ] || die "Execute como root (use sudo)."
 
 # --------------------------- deteccao de distro ----------------------------
