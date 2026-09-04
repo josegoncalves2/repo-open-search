@@ -78,8 +78,18 @@ fi
 # virar 'keyword' - em 'text' as agregacoes abaixo falham.
 log "Criando visualizacoes e o dashboard 'Agentes'"
 
+# O 'index' do index pattern vai DENTRO do searchSourceJSON (nao so via
+# 'references'). Objetos criados pela UI de verdade (ex.: as amostras
+# "Add sample data", confirmadas renderizando) gravam
+# searchSourceJSON:{"index":"<id>",...} com references:[] vazio - a
+# indirecao "kibanaSavedObjectMeta.searchSourceJSON.index" + references so e
+# resolvida no fluxo de save/load da propria app; via POST direto na API,
+# esse inject NUNCA roda, e o Vis fica sem indexPattern -> painel quebra com
+# "Trying to initialize aggs without index pattern". Comparado byte a byte
+# contra '(Metric) Unique visitors' (mesmo tipo, confirmado funcionando) para
+# achar a diferenca. references fica so como metadado de relacionamento.
 IDXREF='[{"name":"kibanaSavedObjectMeta.searchSourceJSON.index","type":"index-pattern","id":"logs-star"}]'
-SRC='{\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":[]}'
+SRC='{\"index\":\"logs-star\",\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":[]}'
 
 put_vis() {  # $1=id  $2=titulo  $3=visState(json escapado)
   osd -XPOST "${OSD_URL}/api/saved_objects/visualization/$1?overwrite=true" -d "{

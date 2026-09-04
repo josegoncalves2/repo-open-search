@@ -215,13 +215,34 @@ services:
   enroll:
     image: nginx:1.31-alpine
     container_name: opensearch-enroll
+    # install.sh mora na raiz do repo (fora de agent/), mas quem instala espera
+    # baixa-lo do mesmo servidor de enroll - sem isto, http://<host>/install.sh
+    # da 404. Nao da para bind-montar o arquivo DENTRO de agent/: agent/ ja e
+    # um bind mount ro em /usr/share/nginx/html, e o Docker nao consegue criar
+    # o mountpoint de um sub-mount dentro de um mount pai somente leitura
+    # ("read-only file system" no runc). Por isso os fontes ficam fora do
+    # document root e o entrypoint copia os dois para la antes de subir o nginx.
     volumes:
-      - ./agent:/usr/share/nginx/html:ro
+      - ./agent:/opt/enroll-src/agent:ro
+      - ./install.sh:/opt/enroll-src/install.sh:ro
+    # 'command' precisa ser uma LISTA de 1 item: como string solta, o Compose
+    # faz shell-split e o '/bin/sh -c' so recebe "cp" (o resto vira $0, $1...
+    # e e ignorado) - o container entra em crash loop imprimindo o usage do cp.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        cp -f /opt/enroll-src/agent/* /opt/enroll-src/install.sh /usr/share/nginx/html/ &&
+        exec nginx -g 'daemon off;'
     ports:
       - "${ENROLL_PORT}:80"
     networks: [opensearch-net]
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost/install-agent.sh >/dev/null || exit 1"]
+      # '127.0.0.1', nao 'localhost': /etc/hosts desta imagem resolve localhost
+      # para ::1 primeiro e o busybox wget nao tenta o proximo endereco -
+      # nginx so escuta em IPv4 (0.0.0.0:80), entao 'localhost' sempre dava
+      # "Connection refused" e o container ficava (unhealthy) apesar de
+      # funcionar normalmente (confirmado via curl externo, HTTP 200).
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/install-agent.sh >/dev/null || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 5

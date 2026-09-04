@@ -80,7 +80,9 @@ if [ -s "$HOSTS_FILE" ]; then
     else printf 'senha SSH: ' >&2; stty -echo 2>/dev/null
          read -r FLEET_SSHPASS < /dev/tty; stty echo 2>/dev/null; echo >&2; fi
   fi
-  FLAG=""; if [ "$DO_UNINSTALL" = 1 ]; then FLAG=" -s -- --uninstall"; fi
+  # o alvo executa um ARQUIVO ('sh /tmp/install-agent.sh --uninstall'), entao os
+  # argumentos vao diretos. O '-s --' so vale na forma com pipe ('curl | sh -s --').
+  FLAG=""; if [ "$DO_UNINSTALL" = 1 ]; then FLAG=" --uninstall"; fi
   OUT=$(mktemp -d); trap 'rm -rf "$OUT" "$HOSTS_FILE"' EXIT
 
   log "Servidor de enroll : http://${FLEET_SERVER}/install-agent.sh"
@@ -213,6 +215,20 @@ REPO
       "$PKG" install -y fluent-bit >/dev/null
       ;;
   esac
+  # O dpkg/rpm pode ja achar o pacote instalado (estado corrompido: o binario
+  # sumiu do disco sem passar por purge/erase, ex.: rm -rf manual, unpack
+  # interrompido) e entao pular a instalacao sem erro nenhum - o systemd so
+  # revela isso depois, com o servico entrando em crash loop (status=203/EXEC).
+  # Confirma que o binario realmente esta no disco; se nao, forca reinstalacao.
+  if ! command -v fluent-bit >/dev/null 2>&1 && [ ! -x /opt/fluent-bit/bin/fluent-bit ]; then
+    warn "Pacote diz instalado mas o binario sumiu - forcando reinstalacao"
+    case "$PKG" in
+      apt) DEBIAN_FRONTEND=noninteractive apt-get install --reinstall -y -qq fluent-bit >/dev/null ;;
+      *)   "$PKG" reinstall -y fluent-bit >/dev/null ;;
+    esac
+  fi
+  command -v fluent-bit >/dev/null 2>&1 || [ -x /opt/fluent-bit/bin/fluent-bit ] \
+    || die "Instalacao do Fluent Bit falhou: binario ausente apos apt-get/yum."
   log "Fluent Bit instalado"
 }
 install_pkg

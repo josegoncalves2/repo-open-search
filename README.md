@@ -28,7 +28,7 @@ Stack completa do **OpenSearch 3.8.0** (versão estável mais recente segundo
 | Embeddings | `all-MiniLM-L6-v2` (384 dim) — local no cluster | ✅ |
 | Index Management | ISM policies (rollover, retenção, snapshots) | ✅ |
 | Agentes | Fluent Bit (Linux/Windows) enviando para `logs-<host>` | ✅ |
-| Enroll | NGINX publicando `install-agent.{sh,ps1}` | ✅ |
+| Enroll | NGINX publicando `install-agent.{sh,ps1}` (um host, ou frota Linux via SSH) | ✅ |
 
 Verificado em cold start (`docker compose down -v && docker compose up -d`):
 cluster `green`, 26 plugins ativos, agent respondendo em linguagem natural.
@@ -76,7 +76,7 @@ cria o usuário com `{"hash": "$2y$12$..."}`. Ver comentários em
 | Arquivo | Função |
 |---|---|
 | `Dockerfile` | Imagem própria do nó: remove Performance Analyzer, adiciona `slf4j-nop`, cria `/certs` |
-| `docker-compose.yml` | Stack: OpenSearch + provisioner + Dashboards + enroll |
+| `docker-compose.yml` | Stack: OpenSearch + provisioner + Dashboards + dashboards-init + enroll |
 | `.env` | Versão, senhas, heap, limites, portas, LLM (**não vai pro Git**) |
 | `.env.example` | Modelo do `.env` |
 | `config/opensearch_dashboards.yml` | Config do Dashboards (Assistant, Query Assist) |
@@ -86,8 +86,10 @@ cria o usuário com `{"hash": "$2y$12$..."}`. Ver comentários em
 | `scripts/provision.sh` | Orquestra o provisionamento pós-boot (roda no container) |
 | `scripts/setup-features.sh` | Ativa features dinâmicas via cluster settings |
 | `scripts/setup-agent-user.sh` | Cria usuário/role de ingestão (`logs-*`) |
+| `scripts/setup-logs.sh` | Index template + política ISM (rollover/retenção) de `logs-*` |
+| `scripts/setup-dashboards.sh` | Index patterns e dashboard "Agentes" no Dashboards |
 | `scripts/setup-ai.sh` | Connector + modelos + root agent (IA/Agentic/LLM) |
-| `agent/install-agent.sh` | Enroll Linux (Fluent Bit) |
+| `agent/install-agent.sh` | Enroll Linux (Fluent Bit) — um host (local) ou frota (`--hosts`/lista de hosts via SSH) |
 | `agent/install-agent.ps1` | Enroll Windows (Fluent Bit) |
 
 > Não existe `config/opensearch.yml` de propósito: montar um arquivo com
@@ -203,12 +205,23 @@ docker compose up -d --force-recreate provisioner
 
 ## 6. Enroll de agentes
 
-**Linux**
+**Um host (o próprio, via curl | sh)**
 
 ```bash
 curl -fsSL http://localhost/install-agent.sh | sudo sh
 curl -fsSL http://localhost/install-agent.sh | sudo sh -s -- --uninstall
 ```
+
+**Vários hosts (frota, via SSH a partir de um host que tenha o script)**
+
+```bash
+./agent/install-agent.sh --hosts hosts.txt          # um [usuario@]host[:porta] por linha
+./agent/install-agent.sh web1 web2 db1               # ou hosts direto na linha de comando
+./agent/install-agent.sh --hosts hosts.txt --uninstall
+```
+
+Por padrão usa chave SSH; `--ask-pass` autentica por senha (exige `sshpass`),
+`--sudo-pass` para sudo com senha. `-j` controla o paralelismo (padrão 10).
 
 **Windows** (PowerShell como Admin)
 
