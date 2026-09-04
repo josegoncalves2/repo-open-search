@@ -17,7 +17,7 @@ set -eu
 OS_HOST="${OS_HOST:-192.168.1.73}"
 OS_PORT="${OS_PORT:-9200}"
 OS_USER="${OS_USER:-agent-ingest}"
-OS_PASS="${OS_PASS:-Ag3nt!Ingest2026#Log}"
+OS_PASS="${OS_PASS:-Ag3nt!Ingest2026#LogSecure}"
 OS_TLS="${OS_TLS:-On}"
 OS_TLS_VERIFY="${OS_TLS_VERIFY:-Off}"   # Off por causa do cert autoassinado (demo)
 INDEX_PREFIX="${INDEX_PREFIX:-logs}"

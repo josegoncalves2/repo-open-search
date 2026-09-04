@@ -16,7 +16,7 @@ param(
     [string] $OsHost      = "192.168.1.73",
     [int]    $OsPort      = 9200,
     [string] $OsUser      = "agent-ingest",
-    [string] $OsPass      = 'Ag3nt!Ingest2026#Log',
+    [string] $OsPass      = 'Ag3nt!Ingest2026#LogSecure',
     [string] $IndexPrefix = "logs",
     [string] $FbVersion   = "3.2.10"
 )
